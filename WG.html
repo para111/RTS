@@ -1,0 +1,701 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>钢铁战队 (Iron Marines) - Phaser 3 完整原型</title>
+  <script src="phaser.min.js"></script>
+  <script src="SpinePlugin.min.js"></script>
+  <style>
+    body {
+      margin: 0;
+      background: #0d1117;
+      overflow: hidden;
+      color: #ffffff;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    }
+    canvas {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+
+<script>
+  // 禁用浏览器右键菜单，保留游戏内右键操作
+  document.addEventListener('contextmenu', event => event.preventDefault());
+
+  // ----------------------------------------------------
+  // 1. 全局配置与基础变量
+  // ----------------------------------------------------
+  const config = {
+    type: Phaser.AUTO,
+    width: 1920,
+    height: 1080,
+    backgroundColor: '#1b1b2f',
+    physics: {
+      default: 'arcade',
+      arcade: { debug: false }
+    },
+    scale: {
+      mode: Phaser.Scale.ENVELOP,
+      width: 1920,
+      height: 1080,
+      autoCenter: Phaser.Scale.CENTER_BOTH
+    },
+    plugins: {
+      scene: [
+        {
+          key: 'SpinePlugin',
+          plugin: window.SpinePlugin,
+          mapping: 'spine'
+        }
+      ]
+    },
+    scene: { preload, create, update }
+  };
+
+  const game = new Phaser.Game(config);
+
+  // 敌军路线节点数组（白线 / 绿线 / 蓝线）
+  const WORLD_WIDTH = 1600;
+  const WORLD_HEIGHT = 1100;
+
+  const enemyRoutes = [
+    {
+      name: 'white',
+      points: [
+        { x: 1460, y: 220 },
+        { x: 1300, y: 220 },
+        { x: 1110, y: 260 },
+        { x: 970, y: 330 },
+        { x: 780, y: 410 },
+        { x: 600, y: 500 },
+        { x: 420, y: 520 },
+        { x: 260, y: 520 }
+      ]
+    },
+    {
+      name: 'green',
+      points: [
+        { x: 1460, y: 520 },
+        { x: 1280, y: 520 },
+        { x: 1100, y: 540 },
+        { x: 940, y: 600 },
+        { x: 780, y: 620 },
+        { x: 610, y: 560 },
+        { x: 420, y: 520 },
+        { x: 260, y: 520 }
+      ]
+    },
+    {
+      name: 'blue',
+      points: [
+        { x: 1460, y: 860 },
+        { x: 1280, y: 860 },
+        { x: 1090, y: 820 },
+        { x: 940, y: 760 },
+        { x: 820, y: 700 },
+        { x: 660, y: 620 },
+        { x: 500, y: 540 },
+        { x: 260, y: 520 }
+      ]
+    }
+  ];
+
+  const yellowShieldBoundary = [
+    { x: 90, y: 200 },
+    { x: 230, y: 160 },
+    { x: 430, y: 140 },
+    { x: 640, y: 120 },
+    { x: 910, y: 180 },
+    { x: 1180, y: 160 },
+    { x: 1420, y: 220 },
+    { x: 1525, y: 330 },
+    { x: 1485, y: 465 },
+    { x: 1185, y: 520 },
+    { x: 960, y: 500 },
+    { x: 760, y: 455 },
+    { x: 560, y: 470 },
+    { x: 360, y: 430 },
+    { x: 180, y: 420 },
+    { x: 90, y: 310 }
+  ];
+
+  const upperShieldZone = [
+    { x: 0, y: 0 },
+    { x: WORLD_WIDTH, y: 0 },
+    { x: WORLD_WIDTH, y: 250 },
+    { x: 1450, y: 250 },
+    { x: 1280, y: 220 },
+    { x: 1060, y: 210 },
+    { x: 760, y: 150 },
+    { x: 440, y: 170 },
+    { x: 180, y: 220 },
+    { x: 0, y: 260 }
+  ];
+
+  const redForbiddenZones = [
+    [
+      { x: 105, y: 180 },
+      { x: 450, y: 155 },
+      { x: 450, y: 290 },
+      { x: 105, y: 290 }
+    ],
+    [
+      { x: 1200, y: 700 },
+      { x: 1480, y: 700 },
+      { x: 1480, y: 900 },
+      { x: 1200, y: 900 }
+    ]
+  ];
+
+  const walkableRegions = [
+    [
+      { x: 120, y: 250 }, { x: 430, y: 170 }, { x: 760, y: 190 },
+      { x: 900, y: 260 }, { x: 1130, y: 220 }, { x: 1510, y: 300 },
+      { x: 1510, y: 460 }, { x: 1190, y: 450 }, { x: 930, y: 470 },
+      { x: 650, y: 450 }, { x: 420, y: 420 }, { x: 180, y: 450 }
+    ],
+    [
+      { x: 120, y: 450 }, { x: 420, y: 430 }, { x: 700, y: 470 },
+      { x: 980, y: 470 }, { x: 1240, y: 470 }, { x: 1510, y: 430 },
+      { x: 1510, y: 610 }, { x: 1230, y: 650 }, { x: 950, y: 650 },
+      { x: 670, y: 610 }, { x: 400, y: 610 }, { x: 150, y: 650 }
+    ],
+    [
+      { x: 140, y: 650 }, { x: 400, y: 620 }, { x: 680, y: 650 },
+      { x: 950, y: 700 }, { x: 1230, y: 680 }, { x: 1510, y: 620 },
+      { x: 1510, y: 900 }, { x: 1200, y: 940 }, { x: 900, y: 900 },
+      { x: 650, y: 820 }, { x: 380, y: 800 }, { x: 150, y: 820 }
+    ]
+  ];
+
+  // RTS 玩家单位状态
+  let playerUnit;
+  let playerCharacter;
+  let moveTarget = null;
+  const UNIT_SPEED = 180;
+  const PLAYER_ATTACK_RANGE = 260;
+  const PLAYER_ATTACK_INTERVAL = 650;
+
+  // 游戏对象容器组
+  let enemiesGroup;
+  let bulletsGroup;
+  let towersGroup;
+  let targetMarker;
+  let focusTarget = null;
+  let selectionCircle;
+  let attackRangeGraphics;
+  let collisionGraphics;
+  let routeGraphics;
+
+  // ----------------------------------------------------
+  // 2. 预加载阶段：使用 Memory Canvas 生成纯代码纹理
+  // ----------------------------------------------------
+  function preload() {
+    // HK416 Spine 角色资源
+    this.load.spine({
+      key: 'HK416',
+      jsonURL: './HK416_s38.json',
+      atlasURL: ['./HK416.atlas'],
+      preMultipliedAlpha: false
+    });
+    this.load.image('HK416:HK416.png', './HK416.png');
+    this.load.image('battleMap', './Stage4-hd.png');
+
+    const g = this.make.graphics({ x: 0, y: 0, add: false });
+
+    // 玩家 RTS 战术小队纹理（绿色带有方向箭头的圆形）
+    g.fillStyle(0x4ecca3, 1);
+    g.fillCircle(16, 16, 16);
+    g.lineStyle(2, 0xffffff, 1);
+    g.strokeCircle(16, 16, 16);
+    g.generateTexture('playerTexture', 32, 32);
+
+    // 战术移动目标标记（红色十字）
+    g.clear();
+    g.lineStyle(2, 0xe63946, 1);
+    g.strokeLineShape(new Phaser.Geom.Line(0, 8, 16, 8));
+    g.strokeLineShape(new Phaser.Geom.Line(8, 0, 8, 16));
+    g.generateTexture('targetTexture', 16, 16);
+
+    // 空防地据点纹理（灰色带有虚拟虚线的方块）
+    g.clear();
+    g.fillStyle(0x393e46, 1);
+    g.fillRect(0, 0, 44, 44);
+    g.lineStyle(2, 0xeeeeee, 0.5);
+    g.strokeRect(2, 2, 40, 40);
+    g.generateTexture('nodeTexture', 44, 44);
+
+    // 防御塔纹理（青色防御建筑）
+    g.clear();
+    g.fillStyle(0x00adb5, 1);
+    g.fillRect(0, 0, 44, 44);
+    g.fillStyle(0xeeeeee, 1);
+    g.fillCircle(22, 22, 10);
+    g.generateTexture('towerTexture', 44, 44);
+
+    // 侵入异形敌人纹理（红色高亮圆球）
+    g.clear();
+    g.fillStyle(0xff2e63, 1);
+    g.fillCircle(12, 12, 12);
+    g.generateTexture('enemyTexture', 24, 24);
+
+    // 导弹/高能子弹纹理（黄色光粒）
+    // g.clear();
+    // g.fillStyle(0xfce38a, 1);
+    // g.fillCircle(4, 4, 4);
+    // g.generateTexture('bulletTexture', 8, 8);
+  }
+
+  // ----------------------------------------------------
+  // 3. 场景构建阶段
+  // ----------------------------------------------------
+  function create() {
+    this.physics.world.setBounds(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
+    this.cameras.main.setBounds(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
+    this.add.image(WORLD_WIDTH / 2, WORLD_HEIGHT / 2, 'battleMap')
+      .setDisplaySize(WORLD_WIDTH, WORLD_HEIGHT)
+      .setDepth(-10);
+
+    // 在地图上显示碰撞/禁入区域以及敌军移动路线
+    collisionGraphics = this.add.graphics().setDepth(-4);
+    routeGraphics = this.add.graphics().setDepth(-3);
+    drawMapGuides();
+
+    // A. 物理组与容器初始化
+    enemiesGroup = this.physics.add.group();
+    bulletsGroup = this.physics.add.group();
+    towersGroup = this.add.group();
+
+    // B. 创建移动目标指示器
+    targetMarker = this.add.sprite(0, 0, 'targetTexture').setVisible(false);
+
+    // C. 初始化 RTS 玩家操控小队
+    // 隐藏的 Arcade 碰撞体负责移动和索敌，画面由 Spine 角色负责渲染
+    playerUnit = this.physics.add.sprite(260, 520, 'playerTexture');
+    playerUnit.setVisible(false);
+    playerUnit.setCollideWorldBounds(true);
+    playerCharacter = this.add.spine(260, 520, 'HK416', 'wait', true);
+    playerCharacter.setScale(0.145);
+    playerCharacter.setDepth(2);
+    playerUnit.nextAttackAt = 0;
+    playerUnit.isSelected = false;
+    playerUnit.isMoving = false;
+    playerCharacter.setVisible(true);
+    this.input.mouse.disableContextMenu();
+    selectionCircle = this.add.graphics().setDepth(1).setVisible(false);
+    attackRangeGraphics = this.add.graphics().setDepth(1).setVisible(false);
+    const camera = this.cameras.main;
+    let isPanning = false;
+    let panLast = null;
+    this.input.on('wheel', (pointer, over, deltaX, deltaY) => {
+      camera.setZoom(Phaser.Math.Clamp(camera.zoom - deltaY * 0.001, 0.6, 2));
+    });
+
+    const selectionGraphics = this.add.graphics().setDepth(10);
+    let selectionStart = null;
+    let isSelecting = false;
+
+    // D. 生成可建造据点节点
+    // const nodePositions = [
+    //   { x: 150, y: 430 },
+    //   { x: 230, y: 430 },
+    //   { x: 150, y: 610 },
+    //   { x: 230, y: 610 }
+    // ];
+
+    // nodePositions.forEach(pos => {
+    //   const node = this.add.sprite(pos.x, pos.y, 'nodeTexture').setInteractive();
+    //   node.isBuilt = false;
+
+    //   // 点击据点：建造防御塔逻辑
+    //   node.on('pointerdown', (pointer, localX, localY, event) => {
+    //     if (!node.isBuilt) {
+    //       node.isBuilt = true;
+    //       node.setTexture('towerTexture');
+    //       node.lastFired = 0;
+    //       towersGroup.add(node);
+    //     }
+    //   });
+    // });
+
+    // E. 全局点击处理：左键框选，右键移动，中键拖动视角
+    this.input.on('pointerdown', (pointer, currentlyOver) => {
+      if (pointer.button === 1) {
+        isPanning = true;
+        panLast = new Phaser.Math.Vector2(pointer.x, pointer.y);
+        return;
+      }
+      if (pointer.button === 0) {
+        selectionStart = new Phaser.Math.Vector2(pointer.worldX, pointer.worldY);
+        isSelecting = true;
+        selectionGraphics.clear();
+        return;
+      }
+      if (pointer.button === 2 && playerUnit.isSelected) {
+        const destination = new Phaser.Math.Vector2(pointer.worldX, pointer.worldY);
+        if (!isWalkable(destination.x, destination.y)) {
+          showCombatText(this, destination.x, destination.y, '无法进入该区域', '#ff6666');
+          return;
+        }
+        moveTarget = destination;
+        targetMarker.setPosition(moveTarget.x, moveTarget.y).setVisible(true);
+        playerUnit.isMoving = true;
+        playerCharacter.setAnimation(0, 'move', true);
+        this.physics.moveToObject(playerUnit, moveTarget, UNIT_SPEED);
+      }
+    });
+    this.input.on('pointermove', pointer => {
+      if (isPanning && panLast) {
+        camera.scrollX -= (pointer.x - panLast.x) / camera.zoom;
+        camera.scrollY -= (pointer.y - panLast.y) / camera.zoom;
+        panLast.set(pointer.x, pointer.y);
+        return;
+      }
+      if (!isSelecting || !selectionStart) return;
+      const x = Math.min(selectionStart.x, pointer.worldX);
+      const y = Math.min(selectionStart.y, pointer.worldY);
+      const width = Math.abs(pointer.worldX - selectionStart.x);
+      const height = Math.abs(pointer.worldY - selectionStart.y);
+      selectionGraphics.clear();
+      selectionGraphics.lineStyle(2, 0x4ecca3, 1);
+      selectionGraphics.fillStyle(0x4ecca3, 0.15);
+      selectionGraphics.fillRect(x, y, width, height);
+      selectionGraphics.strokeRect(x, y, width, height);
+    });
+    this.input.on('pointerup', pointer => {
+      if (pointer.button === 1) {
+        isPanning = false;
+        panLast = null;
+        return;
+      }
+      if (!isSelecting || !selectionStart) return;
+      const selection = new Phaser.Geom.Rectangle(
+        Math.min(selectionStart.x, pointer.worldX),
+        Math.min(selectionStart.y, pointer.worldY),
+        Math.abs(pointer.worldX - selectionStart.x),
+        Math.abs(pointer.worldY - selectionStart.y)
+      );
+      const isClick = selection.width < 8 && selection.height < 8;
+      if (!isClick) {
+        playerUnit.isSelected = Phaser.Geom.Rectangle.Contains(selection, playerUnit.x, playerUnit.y);
+      }
+      playerCharacter.setVisible(true);
+      selectionCircle.setVisible(playerUnit.isSelected);
+      attackRangeGraphics.setVisible(playerUnit.isSelected);
+      selectionGraphics.clear();
+      selectionStart = null;
+      isSelecting = false;
+    });
+
+    // F. 敌人按路线每 5 秒生成 1 个，且每条路线各生成 1 个
+    this.time.addEvent({
+      delay: 5000,
+      callback: () => {
+        enemyRoutes.forEach(route => spawnEnemyRouteUnit(this, route));
+      },
+      loop: true
+    });
+
+
+    // H. UI 操作指南与颜色图例
+    this.add.text(16, 16, '【颜色图例】\n绿色填充：可行走区域\n青色填充：上方护盾区\n黄色边界：碰撞屏蔽区\n红色填充：禁入区域\n白 / 绿 / 蓝线：敌军移动路线\n\n【操作】左键框选单位，右键移动，中键拖动视角', {
+      fontSize: '14px',
+      color: '#ffffff',
+      backgroundColor: '#00000088',
+      padding: { x: 8, y: 6 }
+    }).setScrollFactor(0).setDepth(20);
+  }
+
+  function drawMapGuides() {
+    collisionGraphics.clear();
+
+    // 可行走区域也属于碰撞判定的边界参考，使用绿色显示
+    walkableRegions.forEach(region => {
+      drawPolygon(collisionGraphics, region, 0x4ecca3, 0x4ecca3, 0.06, 2);
+    });
+    // 上方护盾区：用青色半透明填充区分于黄色边界
+    drawPolygon(collisionGraphics, upperShieldZone, 0x00adb5, 0x00adb5, 0.14, 2);
+    // 黄色多边形边界是实际的碰撞屏蔽区
+    drawPolygon(collisionGraphics, yellowShieldBoundary, 0xfce38a, 0xfce38a, 0.1, 4);
+    // 红色区域是禁入区
+    redForbiddenZones.forEach(zone => {
+      drawPolygon(collisionGraphics, zone, 0xff2e63, 0xff2e63, 0.2, 3);
+    });
+
+    routeGraphics.clear();
+    const routeStyles = {
+      white: { color: 0xffffff, alpha: 0.95 },
+      green: { color: 0x4ecca3, alpha: 0.95 },
+      blue: { color: 0x3da9ff, alpha: 0.95 }
+    };
+    enemyRoutes.forEach(route => {
+      const style = routeStyles[route.name];
+      routeGraphics.lineStyle(4, style.color, style.alpha);
+      routeGraphics.beginPath();
+      route.points.forEach((point, index) => {
+        if (index === 0) routeGraphics.moveTo(point.x, point.y);
+        else routeGraphics.lineTo(point.x, point.y);
+      });
+      routeGraphics.strokePath();
+
+      route.points.forEach((point, index) => {
+        routeGraphics.fillStyle(style.color, 1);
+        routeGraphics.fillCircle(point.x, point.y, index === 0 ? 7 : 5);
+        routeGraphics.lineStyle(1, 0x111111, 0.9);
+        routeGraphics.strokeCircle(point.x, point.y, index === 0 ? 7 : 5);
+      });
+    });
+  }
+
+  function drawPolygon(graphics, points, fillColor, lineColor, fillAlpha, lineWidth) {
+    graphics.fillStyle(fillColor, fillAlpha);
+    graphics.fillPoints(points, true);
+    graphics.lineStyle(lineWidth, lineColor, 0.95);
+    graphics.strokePoints(points, true);
+  }
+
+  function pointInPolygon(x, y, polygonPoints) {
+    let inside = false;
+    for (let i = 0, j = polygonPoints.length - 1; i < polygonPoints.length; j = i++) {
+      const xi = polygonPoints[i].x;
+      const yi = polygonPoints[i].y;
+      const xj = polygonPoints[j].x;
+      const yj = polygonPoints[j].y;
+      const intersect = ((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi + 0.000001) + xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+
+  function isZoneBlocked(x, y) {
+    if (pointInPolygon(x, y, upperShieldZone)) return true;
+    if (pointInPolygon(x, y, yellowShieldBoundary)) return true;
+    return redForbiddenZones.some(zone => pointInPolygon(x, y, zone));
+  }
+
+  function updateEnemyHealthBar(enemy) {
+    if (!enemy.active || !enemy.hpBar) return;
+    const width = 34;
+    const ratio = Phaser.Math.Clamp(enemy.hp / enemy.maxHp, 0, 1);
+    enemy.hpBar.clear();
+    enemy.hpBar.fillStyle(0x111111, 0.9);
+    enemy.hpBar.fillRect(enemy.x - width / 2, enemy.y - 22, width, 5);
+    enemy.hpBar.fillStyle(0x49d17d, 1);
+    enemy.hpBar.fillRect(enemy.x - width / 2, enemy.y - 22, width * ratio, 5);
+  }
+
+  function spawnEnemyRouteUnit(scene, routeData) {
+    const start = routeData.points[0];
+    const enemy = enemiesGroup.create(start.x, start.y, 'enemyTexture');
+    enemy.route = routeData.points;
+    enemy.waypointIndex = 1;
+    enemy.hp = 3;
+    enemy.maxHp = 3;
+    enemy.speed = 110;
+    enemy.hpBar = scene.add.graphics().setDepth(4);
+    enemy.setInteractive();
+    enemy.on('pointerdown', (pointer) => {
+      if (pointer.button === 0) {
+        focusTarget = enemy;
+      }
+    });
+  }
+
+  function getSafeRouteTarget(enemy) {
+    for (let i = enemy.waypointIndex; i < enemy.route.length; i++) {
+      const target = enemy.route[i];
+      if (!isZoneBlocked(target.x, target.y)) return { target, index: i };
+    }
+    return null;
+  }
+
+  function isWalkable(x, y) {
+    if (!Phaser.Geom.Rectangle.Contains(new Phaser.Geom.Rectangle(0, 0, WORLD_WIDTH, WORLD_HEIGHT), x, y)) return false;
+    if (isZoneBlocked(x, y)) return false;
+    return walkableRegions.some(region => Phaser.Geom.Polygon.Contains(new Phaser.Geom.Polygon(region), x, y));
+  }
+
+  function showCombatText(scene, x, y, text, color) {
+    const label = scene.add.text(x, y, text, {
+      fontSize: '14px',
+      color,
+      fontStyle: 'bold',
+      stroke: '#111111',
+      strokeThickness: 3
+    }).setOrigin(0.5).setDepth(8);
+    scene.tweens.add({
+      targets: label,
+      y: y - 24,
+      alpha: 0,
+      duration: 700,
+      onComplete: () => label.destroy()
+    });
+  }
+
+  // ----------------------------------------------------
+  // 4. 逐帧主循环
+  // ----------------------------------------------------
+  function update(time, delta) {
+    // Spine 显示对象跟随玩家碰撞体
+    playerCharacter.setPosition(playerUnit.x, playerUnit.y);
+    selectionCircle.clear();
+    if (playerUnit.isSelected) {
+      selectionCircle.setVisible(true);
+      selectionCircle.lineStyle(2, 0x3da9ff, 0.95);
+      selectionCircle.fillStyle(0x3da9ff, 0.18);
+      selectionCircle.fillEllipse(playerUnit.x, playerUnit.y + 9, 28, 12);
+      selectionCircle.strokeEllipse(playerUnit.x, playerUnit.y + 9, 28, 12);
+    } else {
+      selectionCircle.setVisible(false);
+    }
+    attackRangeGraphics.clear();
+    if (playerUnit.isSelected) {
+      attackRangeGraphics.setVisible(true);
+      attackRangeGraphics.lineStyle(2, 0xffffff, 0.95);
+      for (let angle = 0; angle < Math.PI * 2; angle += Math.PI / 12) {
+        const start = angle;
+        const end = angle + Math.PI / 24;
+        attackRangeGraphics.beginPath();
+        attackRangeGraphics.arc(playerUnit.x, playerUnit.y, PLAYER_ATTACK_RANGE, start, end, false);
+        attackRangeGraphics.strokePath();
+      }
+    } else {
+      attackRangeGraphics.setVisible(false);
+    }
+
+    // --------------------------------------------------
+    // 逻辑 1：RTS 玩家单位移动与到达距离容差控制
+    // --------------------------------------------------
+    if (moveTarget) {
+      const dist = Phaser.Math.Distance.BetweenPoints(playerUnit, moveTarget);
+      const nextX = playerUnit.x + playerUnit.body.velocity.x * delta / 1000;
+      const nextY = playerUnit.y + playerUnit.body.velocity.y * delta / 1000;
+      if (!isWalkable(nextX, nextY)) {
+        playerUnit.body.stop();
+        moveTarget = null;
+        playerUnit.isMoving = false;
+        playerCharacter.setAnimation(0, 'wait', true);
+      }
+      if (dist < 4) {
+        playerUnit.body.reset(moveTarget.x, moveTarget.y);
+        moveTarget = null;
+        playerUnit.isMoving = false;
+        targetMarker.setVisible(false);
+        playerCharacter.setAnimation(0, 'wait', true);
+      }
+    }
+
+    // 逻辑 2：玩家单位自动索敌与攻击
+    if (!playerUnit.isMoving && time >= playerUnit.nextAttackAt) {
+      let closestEnemy = null;
+      let minDistance = PLAYER_ATTACK_RANGE;
+
+      enemiesGroup.getChildren().forEach(enemy => {
+        if (!enemy.active) return;
+        const dist = Phaser.Math.Distance.Between(playerUnit.x, playerUnit.y, enemy.x, enemy.y);
+        if (enemy === focusTarget && dist < PLAYER_ATTACK_RANGE) {
+          closestEnemy = enemy;
+          minDistance = dist;
+        } else if (!closestEnemy && dist < minDistance) {
+          minDistance = dist;
+          closestEnemy = enemy;
+        }
+      });
+
+      if (closestEnemy) {
+        applyPlayerHit(this, closestEnemy, 1);
+        playerUnit.nextAttackAt = time + PLAYER_ATTACK_INTERVAL;
+        playerCharacter.setAnimation(0, 'attack', false);
+        playerCharacter.addAnimation(0, playerUnit.isMoving ? 'move' : 'wait', true, 0);
+      }
+
+      function applyPlayerHit(scene, enemy, damage) {
+        if (!enemy.active) return;
+        enemy.hp -= damage;
+        showCombatText(scene, enemy.x, enemy.y - 42, `-${damage}`, '#fce38a');
+        updateEnemyHealthBar(enemy);
+        if (enemy.hp <= 0) {
+          if (focusTarget === enemy) focusTarget = null;
+          enemy.hpBar.destroy();
+          enemy.destroy();
+        }
+      }
+    }
+
+    // --------------------------------------------------
+    // 逻辑 3：敌军沿着 Waypoints 路线自动寻路
+    // --------------------------------------------------
+    enemiesGroup.getChildren().forEach(enemy => {
+      if (!enemy.active) return;
+
+      const routeTarget = getSafeRouteTarget(enemy);
+      if (!routeTarget) {
+        enemy.hpBar.destroy();
+        enemy.destroy();
+        return;
+      }
+
+      const targetWP = routeTarget.target;
+      if (enemy.waypointIndex !== routeTarget.index) {
+        enemy.waypointIndex = routeTarget.index;
+      }
+
+      updateEnemyHealthBar(enemy);
+      const dist = Phaser.Math.Distance.Between(enemy.x, enemy.y, targetWP.x, targetWP.y);
+
+      if (dist < 6) {
+        enemy.waypointIndex++;
+        if (enemy.waypointIndex >= enemy.route.length) {
+          enemy.hpBar.destroy();
+          enemy.destroy();
+          return;
+        }
+      }
+
+      const nextX = enemy.x + enemy.body.velocity.x * delta / 1000;
+      const nextY = enemy.y + enemy.body.velocity.y * delta / 1000;
+      const currentTarget = enemy.route[enemy.waypointIndex];
+      if (currentTarget && isWalkable(nextX, nextY) && !isZoneBlocked(currentTarget.x, currentTarget.y)) {
+        this.physics.moveToObject(enemy, currentTarget, enemy.speed);
+      } else {
+        enemy.body.stop();
+      }
+    });
+
+    // --------------------------------------------------
+    // 逻辑 4：防御塔自动索敌与开火冷却
+    // --------------------------------------------------
+    towersGroup.getChildren().forEach(tower => {
+      if (time > tower.lastFired) {
+        let closestEnemy = null;
+        let minDistance = 150; // 防御塔攻击射程限制 (像素)
+
+        // 挑选射程范围内的最近目标
+        enemiesGroup.getChildren().forEach(enemy => {
+          if (!enemy.active) return;
+          const dist = Phaser.Math.Distance.Between(tower.x, tower.y, enemy.x, enemy.y);
+          if (dist < minDistance) {
+            minDistance = dist;
+            closestEnemy = enemy;
+          }
+        });
+
+        // 索敌成功，发射子弹
+        if (closestEnemy) {
+          const bullet = bulletsGroup.create(tower.x, tower.y, 'bulletTexture');
+          bullet.damage = 1;
+          this.physics.moveToObject(bullet, closestEnemy, 400);
+          this.time.delayedCall(2500, () => {
+            if (bullet.active) bullet.destroy();
+          });
+          tower.lastFired = time + 750; // 750ms 攻击间隔
+        }
+      }
+    });
+  }
+</script>
+
+</body>
+</html>
