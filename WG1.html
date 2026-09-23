@@ -268,12 +268,6 @@
   // 该值同时决定绕行曲线（沿红区外沿的等距轮廓）与逐帧推离的安全带宽度，
   // 队员各自再按阵型单独校验一次，因此贴近红区行走时也不会有人物挤进屏蔽区
   const PLAYER_RED_ZONE_CLEARANCE = ACTIVE_PLAYER_RECORD.red_zone_clearance;   // 19
-  // 我方每名队员与绿色屏蔽区（可行动区轮廓外侧到地图蓝线之间）边缘的净空宽度。
-  // 绿色屏蔽区与红色屏蔽区在几何上是同一种东西——「一块禁止进入的多边形区域」，
-  // 只是禁区在内（红）还是在外（绿）：因此净空宽度、等距轮廓、贴边滑动全部复用同一套代码，
-  // 唯一差别是轮廓偏移的符号（红区外扩、绿边界内推）。
-  // 默认与红区取同一数值（19），单独抽成常量是为了以后能独立调整而不用动红区
-  const PLAYER_GREEN_ZONE_CLEARANCE = PLAYER_RED_ZONE_CLEARANCE;   // 19
   // 敌军智能追踪参数：我方单位一进入追踪范围（160 像素）就激活追踪，
   // 追踪期间以 150 像素/秒恒定逼近，追到默认攻击范围边缘（停火距离，同一 100 像素）即停住交火；
   // 姿态随距离即时切换：我方人形在攻击范围内时姿态恒为攻击动作（循环保持），
@@ -304,11 +298,7 @@
   const POINT_QUERY_WALKABLE_RESULT = 1 << 16;  // 高位区：可行走结论为真
   const POINT_QUERY_RESULT_SHIFT = 16;
   const pointQueryCache = new Map();
-  // 净空位按「查询种类」分开分配：红色屏蔽区与绿色屏蔽区用同一套净空宽度数值，
-  // 但结论不同（红看「离红区够远」、绿看「在可行动区内侧且离绿边界够远」）。
-  // 两者共用同一条 pointQueryCache 记录，所以位必须分开，否则绿区查询会读到红区结论。
-  // 两类各占一张表，共享同一个位游标
-  const clearanceQueryBits = new Map();         // 'red'|'green' + 净空宽度 → 该净空在低位区占用的位
+  const clearanceQueryBits = new Map();         // 净空宽度 → 该净空在低位区占用的位
   let nextClearanceQueryBit = 2;
 
   // 坐标 → 整数键：x 放高位、y 放低 16 位，两个轴都夹取到 16 位有符号范围。
@@ -321,16 +311,14 @@
   }
 
   // 净空宽度只有固定几种取值（安全带、安全带 + 亚像素转向偏置等），惰性各分配一位；
-  // 位用尽时返回 0，调用方据此跳过缓存（直接计算），结论不受影响。
-  // kind 区分红区/绿区两类净空查询（见上），键拼成字符串以免两类互相覆盖
-  function getClearanceQueryBit(clearance, kind = 'red') {
-    const cacheKey = kind + clearance;
-    let bit = clearanceQueryBits.get(cacheKey);
+  // 位用尽时返回 0，调用方据此跳过缓存（直接计算），结论不受影响
+  function getClearanceQueryBit(clearance) {
+    let bit = clearanceQueryBits.get(clearance);
     if (bit === undefined) {
       if (nextClearanceQueryBit > 1 << 14) return 0;
       bit = nextClearanceQueryBit;
       nextClearanceQueryBit <<= 1;
-      clearanceQueryBits.set(cacheKey, bit);
+      clearanceQueryBits.set(clearance, bit);
     }
     return bit;
   }
@@ -410,65 +398,6 @@
     return satisfied;
   }
 
-  // 绿色屏蔽区（可行动区轮廓外侧）的线段净空记忆化：结构与红区完全一致、单独一张表，
-  // 因为两者的判定对象不同（红区是多边形内部、绿区是多边形外侧），键不能混用。
-  // 只在碰撞配置被改写时清空
-  let greenSegmentMemos = new Map();
-  // 线段可行走抽样的记忆化（与上面两张表同构，键用对象同一性）。
-  // 严格口径的 A* 复核会对同一批轮廓节点对反复抽样，而长线段一次要抽几十个采样点：
-  // 实测盾路由的严格复核单次产生约六千次抽样，是净空规划里除线段距离之外最大的一处开销
-  let walkableSegmentMemos = new WeakMap();
-  function isGreenClearanceSatisfied(from, to, clearance, slack) {
-    let bySlack = greenSegmentMemos.get(clearance);
-    if (!bySlack) {
-      bySlack = new Map();
-      greenSegmentMemos.set(clearance, bySlack);
-    }
-    let memo = bySlack.get(slack);
-    if (!memo) {
-      memo = new WeakMap();
-      bySlack.set(slack, memo);
-    }
-    let byTo = memo.get(from);
-    if (byTo) {
-      const cached = byTo.get(to);
-      if (cached !== undefined) return cached;
-    } else {
-      byTo = new WeakMap();
-      memo.set(from, byTo);
-    }
-    // 与红区相反：绿边界禁的是「多边形外侧」，所以只要线段到边界折线的距离不小于净空即可。
-    // 注意该距离是无符号的——线段两端在外侧时它同样是正数，因此「在内侧」必须由调用方
-    // 用 isWalkable（内含 pointInPolygon）另行保证；两端在内、中间穿出凹口的弦会在
-    // 交点处距离降到 0，这里能正确判否。
-    //
-    // 先用「线段包围盒到每条绿边界边包围盒」的最小距离做充分条件：包围盒距离是真实距离的
-    // 下界，它已经大于净空时线段必然安全。绿多边形占全图一半、内部线段离边界可达数百像素，
-    // 这一支把它们从「逐边精确求距 + 两次昂贵的端点最近边查询」里摘出来；贴着绿边界的线段
-    // 通常在头几次比较就退出循环，代价只有一两次比较。这一段是盾判定的性能命门：
-    // 逐帧转向、贴边滑动、A* 松弛都会调用它，而调用方的坐标对象每帧都是新建的，
-    // 记忆化在这些场合基本不命中
-    const boundary = collisionRegions.walkableBoundary;
-    const edges = getZoneEdgeGrid(boundary).edges;
-    const minX = Math.min(from.x, to.x);
-    const maxX = Math.max(from.x, to.x);
-    const minY = Math.min(from.y, to.y);
-    const maxY = Math.max(from.y, to.y);
-    let lowerBound = Infinity;
-    for (let i = 0; i < boundary.length; i++) {
-      const offsetX = Math.max(0, Math.max(edges[i * 4] - maxX, minX - edges[i * 4 + 2]));
-      const offsetY = Math.max(0, Math.max(edges[i * 4 + 1] - maxY, minY - edges[i * 4 + 3]));
-      const distance = Math.hypot(offsetX, offsetY);
-      if (distance < lowerBound) lowerBound = distance;
-      if (lowerBound <= clearance) break;
-    }
-    const satisfied = lowerBound > clearance
-      ? true
-      : getZoneSegmentDistance(boundary, from, to) >= clearance - slack;
-    byTo.set(to, satisfied);
-    return satisfied;
-  }
-
   // 单帧内允许执行的整段绕行规划次数上限：队员归队与敌方绕行各一份名额。
   // 三到六名队员同时贴边归队、或敌军成片转向时，逐人整段规划会让单帧开销成倍增长，
   // 于是把同一帧里的多次规划摊到相邻若干帧上。没排上名额的单位本帧沿用既有路径
@@ -479,55 +408,6 @@
   let memberReturnPlanCount = 0;
   let enemyReplanFrame = -1;
   let enemyReplanCount = 0;
-
-  // 寻路性能度量（仅调试用，经 window.__WG__.pathStats 读取）：
-  // 只做累加与赋值，不参与任何判定分支，因此不改变寻路行为。
-  // lastPathLen / lastStraightLen 的比值是「是否绕远路」的量化指标，
-  // 也是判断贪心近优门槛（Phase 4）与环连通性重构（Phase 5）是否需要启用的依据。
-  const redPathStats = {
-    planMs: 0,          // 累计整段规划耗时 (ms)
-    planCount: 0,       // 整段规划次数
-    maxPlanMs: 0,       // 单次规划最大耗时 (ms)
-    slideMs: 0,         // 累计沿轮廓滑动耗时 (ms)
-    slideCalls: 0,      // 沿轮廓滑动调用次数
-    slideHits: 0,       // 其中成功返回转向点的次数
-    lastNodes: 0,       // 最近一次规划得到的路径节点数
-    lastPathLen: 0,     // 最近一次规划的路径长度 (px)
-    lastGreedyLen: 0,   // 最近一次规划中贪心贴边路径长度 (px)，0 表示该路径不可用
-    lastStraightLen: 0, // 最近一次规划的起点-终点直线距离 (px)
-    noRouteCount: 0,    // 规划失败（无法安全绕行）次数
-    lastGreenNodes: 0,  // 最近一次盾路由纳入的绿环节点数（0 表示本次未纳入绿环）
-    greenRouteCount: 0  // 盾路由中绿环被纳入 A* 图（并触发贴绿边绕行）的次数
-  };
-  function resetRedPathStats() {
-    redPathStats.planMs = 0;
-    redPathStats.planCount = 0;
-    redPathStats.maxPlanMs = 0;
-    redPathStats.slideMs = 0;
-    redPathStats.slideCalls = 0;
-    redPathStats.slideHits = 0;
-    redPathStats.lastNodes = 0;
-    redPathStats.lastPathLen = 0;
-    redPathStats.lastGreedyLen = 0;
-    redPathStats.lastStraightLen = 0;
-    redPathStats.noRouteCount = 0;
-    redPathStats.lastGreenNodes = 0;
-    redPathStats.greenRouteCount = 0;
-  }
-  // 记录一次整段规划的结果（耗时、节点数、路径长度、直线下界）
-  function recordRedPlan(start, end, path, startedAt) {
-    const elapsed = performance.now() - startedAt;
-    redPathStats.planMs += elapsed;
-    redPathStats.planCount += 1;
-    if (elapsed > redPathStats.maxPlanMs) redPathStats.maxPlanMs = elapsed;
-    if (!path || !path.length) {
-      redPathStats.noRouteCount += 1;
-      return;
-    }
-    redPathStats.lastNodes = path.length;
-    redPathStats.lastPathLen = getClearancePathCost(start, path);
-    redPathStats.lastStraightLen = Phaser.Math.Distance.Between(start.x, start.y, end.x, end.y);
-  }
 
   function takeMemberReturnPlanSlot() {
     if (memberReturnPlanFrame !== redQueryFrame) {
@@ -559,29 +439,16 @@
   // 单个红区环上参与「贴边进/出点」评估的候选采样点数上限：环有数百个采样点，
   // 其中直线距离下界小于当前最优的点可能有上百个，每个都要跑两次线段净空判定。
   // 按直线下界升序只评估最靠前的若干个（几何最优解必然落在离起点/终点最近的这一段），
-  // 单环判定量从上千次压到不足百次，多支小队同帧下达移动指令时开销不再线性叠加。
-  // 取值必须大于「抽稀后的环节点数」（大块红区实测约 74 点）：上限若小于环节点数，
-  // 真正的切点可能落在被截断的尾段里，贴边路线会明显绕远。
-  // 升序 + 下界剪枝（见 getRingWalkLeg）本身已保证最优性，这里只作为兜底的规模上限
-  const PLAYER_RED_WALK_LEG_CANDIDATE_LIMIT = 192;
+  // 单环判定量从上千次压到不足百次，多支小队同帧下达移动指令时开销不再线性叠加
+  const PLAYER_RED_WALK_LEG_CANDIDATE_LIMIT = 48;
   // 每帧用于「曲线绕行规划」的时间预算 (ms)：框选多支小队会在一帧内连续下达多条移动指令，
   // 每条都要跑一轮轮廓搜索，全部挤在同一帧里会明显掉帧；超预算的指令顺延到后续帧，
   // 等待期间小队先按直接转向前进（转向内部自带安全带脱离与沿红区滑动兜底），不会停在原地
   const PLAYER_PATH_FRAME_BUDGET = 4;
   const PLAYER_RED_ARC_STEP = 0.25;            // 凸角等距圆弧的采样角步长（弧度）
   const PLAYER_RED_WALKABLE_SAMPLE_STEP = 16;  // 连线可行动性抽样间距
-  // 单条连线的可行动性抽样点数上限：按间距算出的点数超过它时不再增加采样。
-  // 上限必须够大：大块红区的绕行弦动辄数百像素，点数被截断到 8 时，超过 128 像素的长弦
-  // 一律欠采样——既可能把合法长弦误判为穿出绿色边界（进而整环作废、绕不过去），
-  // 也可能漏掉中间一小段越界的弦而放行。32 点可覆盖 512 像素，
-  // 且该分支只在最终校验（strict）时执行，点查询本身已按 4 像素键记忆化，开销有界
-  const PLAYER_RED_WALKABLE_SAMPLE_MAX = 32;
   const PLAYER_RED_CORRECTION_ITERATIONS = 4;  // 推离红区的迭代次数
   const PLAYER_RED_SLIDE_RANGE = 24;           // 允许沿红区轮廓滑动的最大偏离
-  // 沿轮廓滑动的方向迟滞：单位停在「离目标最近的那个轮廓点」附近时，前后两侧弧长几乎相等，
-  // 逐帧比较会随亚像素变化来回翻转方向，表现为贴边原地抖动。要求后方弧长比前方短该比例
-  // 以上才改走反向，等价点处方向恒定；真正需要折返时（后方明显更短）几帧内仍会正确翻转
-  const PLAYER_RED_SLIDE_HYSTERESIS = 0.12;
   const PLAYER_RED_ARRIVE_DISTANCE = 2;        // 途经红区外沿节点的到达判定距离
   const PLAYER_MOVE_STALL_TIMEOUT = playerNumber('move_stall_timeout', { integer: true, min: 0 });      // 队长贴着红区边缘打转、长时间无法靠近终点的判定时长 (ms)
   const PLAYER_MOVE_PROGRESS_EPSILON = playerNumber('move_progress_epsilon', { min: 0 });    // 判定「确实靠近了终点」的最小距离 (px)
@@ -990,6 +857,7 @@
       morphProgress: 0,
       squeezed: false,
       freeActive: false,
+      regroup: false,
       slotAssignment: {},
       slotSwapped: true,
       moveTarget: null,
@@ -1120,8 +988,7 @@
   function resolvePlayerSquadOrderGoals(centerX, centerY, total) {
     if (total <= 1) return [{ x: centerX, y: centerY }];
     const spread = getPlayerSquadOrderSpread(total);
-    // 落点必须同时离开红区与绿屏蔽区：小队指令的终点也走「盾」口径
-    const safe = (x, y) => isShieldClearanceSafePoint(x, y, PLAYER_RED_ZONE_CLEARANCE);
+    const safe = (x, y) => isWalkable(x, y) && isRedClearanceSafePoint(x, y, PLAYER_RED_ZONE_CLEARANCE);
     // 正 N 边形理想落点的相邻间距恰好等于 spread，浮点误差会让它差出亚像素而误判为「过近」，
     // 把本来站得下的理想落点整批挪走、落点间距被压小。这里留 1 像素容差：间距低于
     // spread - 1 才算真正过近，理想落点只有在真实被挡时才进入挪动搜索
@@ -1941,8 +1808,6 @@
     redContourCache.clear();
     redContourNodeCache.clear();
     segmentZoneMemos.clear();
-    greenSegmentMemos.clear();
-    walkableSegmentMemos = new WeakMap();
     redZoneEdgeGridCache = new WeakMap();
     collisionSegmentBoundsCache = null;
   }
@@ -2135,24 +2000,15 @@
     return nearest;
   }
 
-  // 红区内离给定点最近的一条边（含最近点坐标），用于推离与逐帧净空判定。
-  // limit 是可选的「距离上界」：调用方只关心「距离是否达到 limit」时（绿区净空判定），
-  // 一旦已经确定结论就立刻收工。绿多边形面积占全图一半、内部点到边界可达近千像素，
-  // 不加这个上界时环形扫描会退化成数百次格子探测——这是绿区判定唯一的性能热点。
-  // limit 为默认的 Infinity 时必须彻底关闭两个提前退出，返回的一定是精确最近边；
-  // 否则「best.distance < Infinity」恒成立，中心格一扫完就返回一个被高估的距离，
-  // 净空判定会整体放松（实测会让 3 个采样点由不安全翻转为安全）
-  function getZoneNearestEdge(zone, x, y, limit = Infinity) {
+  // 红区内离给定点最近的一条边（含最近点坐标），用于推离与逐帧净空判定
+  function getZoneNearestEdge(zone, x, y) {
     const grid = getZoneEdgeGrid(zone);
     beginZoneGridQuery(grid);
-    const bounded = limit !== Infinity;
     const cell = RED_ZONE_GRID_CELL;
     const cx = Math.floor(x / cell) - grid.baseCx;
     const cy = Math.floor(y / cell) - grid.baseCy;
     const best = { distance: Infinity, point: null, edgeIndex: -1 };
     scanZoneGridCellForPoint(grid, zone, x, y, cx, cy, best);
-    // 中心格就已经找到比 limit 更近的点：结论（距离 < limit）已确定
-    if (bounded && best.distance < limit) return best;
 
     const lastRing = Math.max(cx, grid.columns - 1 - cx, cy, grid.rows - 1 - cy, 0);
     // 圈从「第一个真正碰到格子表」的那一圈开始：查询点落在格子表之外时，前面的圈里
@@ -2163,13 +2019,6 @@
     let lowerBound = 0;
     for (let ring = startRing; ring <= lastRing; ring++) {
       if (lowerBound > best.distance) break;
-      if (bounded) {
-        // 已扫到的最小距离比 limit 更近：结论（距离 < limit）已确定
-        if (best.distance < limit) break;
-        // 未扫描部分到查询点的距离下界已不小于 limit：无论后面还藏着什么，
-        // 真实最近距离都必然 >= limit，结论已确定（best.distance 保持不小于 limit 的值）
-        if (lowerBound >= limit) break;
-      }
       const ringMinX = cx - ring;
       const ringMaxX = cx + ring;
       const ringMinY = cy - ring;
@@ -2258,26 +2107,14 @@
     return area >= 0 ? 1 : -1;
   }
 
-  // 轮廓缓存项：points 为等距偏移后的采样折线；arcPrefix 是环绕折线的前缀弧长，
-  // 用于把「沿轮廓的弧长」查询从 O(轮廓点数) 降到 O(1)（见 getContourArcLength）。
-  // 前缀弧长由 points 派生、下标一一对应（corrected 用 map 生成，保序保长），因此可与轮廓同缓存。
-  // offsetSign：+1 = 向外扩（红色屏蔽区，禁区在多边形内部，安全侧在外）；
-  //             -1 = 向内推（绿色屏蔽区，禁区在多边形外侧，安全侧在内）。
-  // 两种环的几何、采样、弧长前缀完全一致，唯一差别就是这个符号。
-  // pointSafe / correct 是该环对应的「点是否带足额净空」与「把点推回净空之外」两个操作
-  function getRedZoneContourEntry(
-    zone,
-    clearance = PLAYER_RED_ZONE_CLEARANCE,
-    offsetSign = 1,
-    pointSafe = isRedClearanceSafePoint,
-    correct = correctPointOutOfRedClearance
-  ) {
+  // 红区外沿的等距轮廓（多边形外扩）：凸角用等距圆弧、凹角用两条偏移线的交点
+  function getRedZoneContour(zone, clearance = PLAYER_RED_ZONE_CLEARANCE) {
     let zoneCache = redContourCache.get(zone);
     if (!zoneCache) {
       zoneCache = new Map();
       redContourCache.set(zone, zoneCache);
     }
-    const cacheKey = `${collisionRegionVersion}:${clearance}:${offsetSign}`;
+    const cacheKey = `${collisionRegionVersion}:${clearance}`;
     const cached = zoneCache.get(cacheKey);
     if (cached) return cached;
 
@@ -2286,11 +2123,9 @@
     const normals = [];
     for (let i = 0; i < count; i++) normals.push(getOutwardNormal(zone, i));
 
-    // 轮廓按 安全带宽度 + 亚像素余量 偏移生成：圆角连接的弦长会略微内凹，
-    // 留出余量可避免相邻采样点连线的实际净空跌破安全带宽度。
-    // 偏移量带符号（内推为负），净空宽度取正值供判定与圆弧使用
-    const clearanceWidth = clearance + RED_CONTOUR_MARGIN;
-    const signedOffset = clearanceWidth * offsetSign;
+    // 轮廓按 安全带宽度 + 亚像素余量 外扩生成：圆角连接的弦长会略微内凹，
+    // 留出余量可避免相邻采样点连线的实际净空跌破 38 像素。
+    const buildClearance = clearance + RED_CONTOUR_MARGIN;
     const contour = [];
     const pushPoint = point => {
       const last = contour[contour.length - 1];
@@ -2303,8 +2138,8 @@
       const nextVertex = zone[(i + 1) % count];
       const normal = normals[i];
       const nextNormal = normals[(i + 1) % count];
-      const offsetStart = { x: vertex.x + normal.x * signedOffset, y: vertex.y + normal.y * signedOffset };
-      const offsetEnd = { x: nextVertex.x + normal.x * signedOffset, y: nextVertex.y + normal.y * signedOffset };
+      const offsetStart = { x: vertex.x + normal.x * buildClearance, y: vertex.y + normal.y * buildClearance };
+      const offsetEnd = { x: nextVertex.x + normal.x * buildClearance, y: nextVertex.y + normal.y * buildClearance };
       const edgeLength = Phaser.Math.Distance.Between(offsetStart.x, offsetStart.y, offsetEnd.x, offsetEnd.y);
       const samples = Math.max(1, Math.ceil(edgeLength / PLAYER_RED_CONTOUR_STEP));
       for (let step = 0; step < samples; step++) {
@@ -2317,10 +2152,7 @@
 
       const cross = normal.x * nextNormal.y - normal.y * nextNormal.x;
       if (Math.abs(cross) <= 0.000001) continue;
-      // 圆弧只用于向外扩：膨胀时凸角处两条偏移边会张开，需要用圆弧补足。
-      // 向内推（腐蚀）时不能发圆弧——cross 在法线整体取反后不变，凸角处发圆弧只会得到
-      // 0.707 倍净空；腐蚀的精确解是两条偏移边的交点，即下面的斜接点
-      if (offsetSign > 0 && cross * orientation > 0) {
+      if (cross * orientation > 0) {
         const startAngle = Math.atan2(normal.y, normal.x);
         const endAngle = Math.atan2(nextNormal.y, nextNormal.x);
         let sweep = (endAngle - startAngle) * orientation;
@@ -2329,8 +2161,8 @@
         for (let step = 1; step <= arcSteps; step++) {
           const angle = startAngle + orientation * sweep * (step / arcSteps);
           pushPoint({
-            x: nextVertex.x + Math.cos(angle) * clearanceWidth,
-            y: nextVertex.y + Math.sin(angle) * clearanceWidth
+            x: nextVertex.x + Math.cos(angle) * buildClearance,
+            y: nextVertex.y + Math.sin(angle) * buildClearance
           });
         }
         continue;
@@ -2338,92 +2170,56 @@
       const denominator = 1 + (normal.x * nextNormal.x + normal.y * nextNormal.y);
       if (denominator < 0.05) continue;
       pushPoint({
-        x: nextVertex.x + (normal.x + nextNormal.x) / denominator * signedOffset,
-        y: nextVertex.y + (normal.y + nextNormal.y) / denominator * signedOffset
+        x: nextVertex.x + (normal.x + nextNormal.x) / denominator * buildClearance,
+        y: nextVertex.y + (normal.y + nextNormal.y) / denominator * buildClearance
       });
     }
 
     // 二次修正：任何仍落在安全带（含余量）内的采样点都推回到安全距离之外，
-    // 保证轮廓点本身自带足额净空，环上相邻点连线才不会割进安全带。
-    // 等距偏移本身已经保证轮廓点在安全带之外，这里先用带缓存的点判定筛一遍，
+    // 保证轮廓点本身自带 38 像素净空，环上相邻点连线才不会割进安全带。
+    // 等距外扩本身已经保证轮廓点在安全带之外，这里先用带缓存的点判定筛一遍，
     // 只有数值退化导致点真的落进安全带以内时才走昂贵的推离流程
     const corrected = contour.map(point => (
-      pointSafe(point.x, point.y, clearanceWidth)
+      isRedClearanceSafePoint(point.x, point.y, buildClearance)
         ? point
-        : correct(point, clearanceWidth)
+        : correctPointOutOfRedClearance(point, buildClearance)
     ));
 
-    // 环绕前缀弧长：arcPrefix[k] 为 contour[0] → contour[k] 的折线长度，
-    // 末位 arcPrefix[n] 为整圈长度（含收尾那条 contour[n-1] → contour[0] 的弦）
-    const pointCount = corrected.length;
-    const arcPrefix = new Float64Array(pointCount + 1);
-    for (let i = 0; i < pointCount; i++) {
-      const next = corrected[(i + 1) % pointCount];
-      arcPrefix[i + 1] = arcPrefix[i] + Phaser.Math.Distance.Between(
-        corrected[i].x, corrected[i].y, next.x, next.y
-      );
-    }
-
-    const entry = { points: corrected, arcPrefix };
-    zoneCache.set(cacheKey, entry);
-    return entry;
+    zoneCache.set(cacheKey, corrected);
+    return corrected;
   }
-
-  // 红区外沿的等距轮廓（多边形外扩）：凸角用等距圆弧、凹角用两条偏移线的交点
-  function getRedZoneContour(zone, clearance = PLAYER_RED_ZONE_CLEARANCE) {
-    return getRedZoneContourEntry(zone, clearance).points;
-  }
-
-  // 屏蔽环描述符：红区（禁区在多边形内部，轮廓外扩）与绿边界（禁区在多边形外侧，轮廓内推）
-  // 在几何算法上完全同构，差别只有「偏移符号」与「用哪一套净空判定 / 推离修正」。
-  // 收进描述符之后，轮廓生成、A* 候选节点、贴边滑动都只认描述符，不再关心是红还是绿。
-  // 绿环的节点用「盾」判定过滤（红 ∧ 绿）：落在红区里的那段绿轮廓会被整段剔除，
-  // 缺口由 A* 自行当作墙处理（该段本来就被红环覆盖，见文件末尾的已知局限说明）
-  const RED_SHIELD_RING = {
-    offsetSign: 1,
-    pointSafe: isRedClearanceSafePoint,
-    segmentSafe: isRedClearanceSafeSegment,
-    correct: correctPointOutOfRedClearance
-  };
-  const GREEN_SHIELD_RING = {
-    offsetSign: -1,
-    pointSafe: isShieldClearanceSafePoint,
-    segmentSafe: isShieldClearanceSafeSegment,
-    correct: correctPointIntoGreenClearance
-  };
 
   // 轮廓采样点中自身仍带足额净空的那一批（A* 的候选节点）：
-  // 结论只由静态几何决定，因此与轮廓同样按「版本号 + 净空宽度 + 偏移符号」缓存，
-  // 不必每次规划都重新对数百个采样点跑一遍点到红区的距离查询。
-  // ring 缺省即红环，因此原有调用点逐位不变
-  function getRedZoneContourNodes(zone, clearance = PLAYER_RED_ZONE_CLEARANCE, ring = RED_SHIELD_RING) {
+  // 结论只由静态几何决定，因此与轮廓同样按「版本号 + 净空宽度」缓存，
+  // 不必每次规划都重新对数百个采样点跑一遍点到红区的距离查询
+  function getRedZoneContourNodes(zone, clearance = PLAYER_RED_ZONE_CLEARANCE) {
     let zoneCache = redContourNodeCache.get(zone);
     if (!zoneCache) {
       zoneCache = new Map();
       redContourNodeCache.set(zone, zoneCache);
     }
-    const cacheKey = `${collisionRegionVersion}:${clearance}:${ring.offsetSign}`;
+    const cacheKey = `${collisionRegionVersion}:${clearance}`;
     const cached = zoneCache.get(cacheKey);
     if (cached) return cached;
-    const raw = getRedZoneContourEntry(zone, clearance, ring.offsetSign, ring.pointSafe, ring.correct).points
-      .filter(point => ring.pointSafe(point.x, point.y, clearance));
+    const raw = getRedZoneContour(zone, clearance)
+      .filter(point => isRedClearanceSafePoint(point.x, point.y, clearance));
     // 采样点之间的弦会切掉弧线（实测最深内凹约 0.5 像素，超过 RED_CONTOUR_MARGIN），
     // 这些弦交给净空判定会失败，轮廓环随之断裂成几段，A* 图失去连通性，
-    // 长距离绕行只能判「无法绕行」。这里对过近的弦递归补插中点并推到安全距离，
+    // 长距离绕行只能判「无法绕行」。这里对过近的弦递归补插中点并外推到安全距离，
     // 保证环上任意相邻两点都是可判为安全的连线。
     const nodes = [];
     const append = (from, to, depth) => {
-      if (ring.segmentSafe(from, to, clearance) || depth >= PLAYER_RED_CONTOUR_REPAIR_DEPTH) {
+      if (isRedClearanceSafeSegment(from, to, clearance) || depth >= PLAYER_RED_CONTOUR_REPAIR_DEPTH) {
         nodes.push(to);
         return;
       }
-      const middle = ring.correct(
+      const middle = correctPointOutOfRedClearance(
         { x: (from.x + to.x) / 2, y: (from.y + to.y) / 2 },
         clearance + RED_CONTOUR_MARGIN
       );
       const usable = Phaser.Math.Distance.Between(from.x, from.y, middle.x, middle.y) > 0.5
         && Phaser.Math.Distance.Between(middle.x, middle.y, to.x, to.y) > 0.5
-        && ring.pointSafe(middle.x, middle.y, clearance);
+        && isRedClearanceSafePoint(middle.x, middle.y, clearance);
       if (!usable) {
         nodes.push(to);
         return;
@@ -2443,7 +2239,7 @@
     for (let index = 0; index < nodes.length; index++) {
       const previous = kept[kept.length - 1];
       const next = nodes[index + 1];
-      if (previous && next && ring.segmentSafe(previous, next, clearance)) continue;
+      if (previous && next && isRedClearanceSafeSegment(previous, next, clearance)) continue;
       kept.push(nodes[index]);
     }
     zoneCache.set(cacheKey, kept);
@@ -2452,8 +2248,7 @@
 
   // 开局预热红区几何缓存：等距轮廓与轮廓节点环都是纯静态几何（只由地图屏蔽区决定），
   // 若等到第一次跨红区移动指令才构建，会把上百毫秒的计算压在那一帧上，表现为明显卡顿。
-  // 开局一次性算完，交互时刻只读缓存；碰撞区域被编辑时 invalidateRedZoneCaches 会整体重建。
-  // 绿边界同样预热：它的轮廓有数百个采样点，不预热就会把首次贴绿边行走顶出明显卡顿
+  // 开局一次性算完，交互时刻只读缓存；碰撞区域被编辑时 invalidateRedZoneCaches 会整体重建
   function prewarmRedContourCache() {
     collisionRegions.redForbiddenZones.forEach(zone => {
       getRedZoneContour(zone, PLAYER_RED_ZONE_CLEARANCE);
@@ -2462,16 +2257,6 @@
       // 否则第一次贴边转向会临时多付一次轮廓构建
       getRedZoneContour(zone, PLAYER_RED_ZONE_CLEARANCE + PLAYER_RED_STEER_BIAS);
     });
-    // 绿环：净空轮廓、净空节点环、转向轮廓（安全带 + 亚像素偏置）
-    const boundary = collisionRegions.walkableBoundary;
-    getRedZoneContourNodes(boundary, PLAYER_GREEN_ZONE_CLEARANCE, GREEN_SHIELD_RING);
-    getRedZoneContourEntry(
-      boundary,
-      PLAYER_GREEN_ZONE_CLEARANCE + PLAYER_RED_STEER_BIAS,
-      GREEN_SHIELD_RING.offsetSign,
-      GREEN_SHIELD_RING.pointSafe,
-      GREEN_SHIELD_RING.correct
-    );
   }
 
   function getNearestRedFeature(x, y) {
@@ -2488,33 +2273,23 @@
     return nearest;
   }
 
-  // 把落在屏蔽环「禁区一侧」或净空带内的点推到安全一侧并补足净空。
-  // 红环（offsetSign = +1，禁区在多边形内部）与绿环（offsetSign = -1，禁区在外侧）
-  // 只差两个符号：哪一侧算「错误一侧」，以及退化时沿法线的推离方向。
-  // nearestFeature(x, y) 负责给出「当前位置最近的环特征」（红环要跨多块红区取最近者）
-  function correctPointOutOfRingClearance(point, clearance, nearestFeature, offsetSign) {
+  // 把落在红区内部或 38 像素安全带内的点推回到刚好 38 像素之外
+  function correctPointOutOfRedClearance(point, clearance = PLAYER_RED_ZONE_CLEARANCE) {
     let current = { x: point.x, y: point.y };
     for (let iteration = 0; iteration < PLAYER_RED_CORRECTION_ITERATIONS; iteration++) {
-      const feature = nearestFeature(current.x, current.y);
-      if (!feature || feature.edgeIndex < 0 || !Number.isFinite(feature.distance)) break;
+      const feature = getNearestRedFeature(current.x, current.y);
+      if (!feature || feature.distance >= clearance - RED_CLEARANCE_TOLERANCE) break;
       const zone = feature.zone;
-      const wrongSide = pointInPolygon(current.x, current.y, zone) === (offsetSign > 0);
-      // 终止条件：净空已足额，且红环不额外判侧（逐位保持既有行为），
-      // 绿环必须判「确实落在可行动区内侧」——到边界折线的距离是无符号的，
-      // 屏蔽区深处的点距离同样充足，不判就会被当成安全点放行
-      const clearanceEnough = feature.distance >= clearance - RED_CLEARANCE_TOLERANCE;
-      if (clearanceEnough && (offsetSign > 0 || !wrongSide)) break;
       let directionX;
       let directionY;
       let push;
       if (feature.distance < 0.0001) {
-        // 正落在边界折线上：无法由「点到最近点」定方向，沿安全一侧的法线推足额净空
         const normal = getOutwardNormal(zone, feature.edgeIndex);
-        directionX = normal.x * offsetSign;
-        directionY = normal.y * offsetSign;
+        directionX = normal.x;
+        directionY = normal.y;
         push = clearance;
-      } else if (wrongSide) {
-        // 已经进入禁区一侧：先沿最近边穿回安全侧，再补足净空
+      } else if (pointInPolygon(current.x, current.y, zone)) {
+        // 已经进入红区：先沿最近边穿出，再补足安全带宽度
         directionX = (feature.point.x - current.x) / feature.distance;
         directionY = (feature.point.y - current.y) / feature.distance;
         push = feature.distance + clearance;
@@ -2531,63 +2306,15 @@
     return current;
   }
 
-  // 绿色屏蔽区的「最近环特征」：只有一条绿边界，直接取该点的最近边
-  function getNearestGreenFeature(x, y) {
-    const boundary = collisionRegions.walkableBoundary;
-    const feature = getZoneNearestEdge(boundary, x, y);
-    if (feature.edgeIndex < 0 || !Number.isFinite(feature.distance)) return null;
-    return { zone: boundary, point: feature.point, distance: feature.distance, edgeIndex: feature.edgeIndex };
-  }
-
-  // 把落在红区内部或 38 像素安全带内的点推回到刚好 38 像素之外
-  function correctPointOutOfRedClearance(point, clearance = PLAYER_RED_ZONE_CLEARANCE) {
-    return correctPointOutOfRingClearance(point, clearance, getNearestRedFeature, 1);
-  }
-
-  // 把落在绿色屏蔽区（可行动区轮廓外侧）或绿边界净空带内的点推到「内侧且距边界足额净空」处。
-  // 先用带距离上界的点判定筛一遍：已经满足净空的点原样返回（推离函数对这种情况同样会立即收工），
-  // 但精确推离需要无限上界的最近边查询，绿多边形内部深处会退化成数百次格子探测，
-  // 而这个函数在阵型摆放里是逐帧逐队员调用的
-  function correctPointIntoGreenClearance(point, clearance = PLAYER_GREEN_ZONE_CLEARANCE) {
-    if (isGreenClearanceSafePoint(point.x, point.y, clearance)) return { x: point.x, y: point.y };
-    return correctPointOutOfRingClearance(point, clearance, getNearestGreenFeature, -1);
-  }
-
-  // 盾推离：我方单位的点要同时离开绿净空带与红净空带。
-  // 两步都是「净空修正」，多数情况下只有一步真正生效（点要么只挨着绿边、要么只挨着红区）；
-  // 两者都违例的位置（绿边界与红区 2 东沿重合的那条带）本就不存在安全站位，
-  // 这里不做反复迭代，交回上层用盾判定复核、走贴边或重新规划
-  function correctPointIntoShieldClearance(point, clearance = PLAYER_RED_ZONE_CLEARANCE) {
-    return correctPointOutOfRedClearance(
-      correctPointIntoGreenClearance(point, PLAYER_GREEN_ZONE_CLEARANCE), clearance
-    );
-  }
-
-  // 沿线抽样检查可行动性，避免长连线切出绿色边界（结论按 walkableSegmentMemos 记忆化）
+  // 沿线抽样检查可行动性，避免长连线切出绿色边界
   function isSegmentWalkable(from, to) {
-    let byTo = walkableSegmentMemos.get(from);
-    if (byTo) {
-      const cached = byTo.get(to);
-      if (cached !== undefined) return cached;
-    } else {
-      byTo = new WeakMap();
-      walkableSegmentMemos.set(from, byTo);
-    }
     const length = Phaser.Math.Distance.Between(from.x, from.y, to.x, to.y);
-    const steps = Math.max(1, Math.min(
-      PLAYER_RED_WALKABLE_SAMPLE_MAX,
-      Math.ceil(length / PLAYER_RED_WALKABLE_SAMPLE_STEP)
-    ));
-    let walkable = true;
+    const steps = Math.max(1, Math.min(8, Math.ceil(length / PLAYER_RED_WALKABLE_SAMPLE_STEP)));
     for (let index = 1; index < steps; index++) {
       const ratio = index / steps;
-      if (!isWalkable(from.x + (to.x - from.x) * ratio, from.y + (to.y - from.y) * ratio)) {
-        walkable = false;
-        break;
-      }
+      if (!isWalkable(from.x + (to.x - from.x) * ratio, from.y + (to.y - from.y) * ratio)) return false;
     }
-    byTo.set(to, walkable);
-    return walkable;
+    return true;
   }
 
   // 红区净空判定：线段到每个红区的最短距离都必须不小于安全带宽度
@@ -2640,71 +2367,11 @@
     return isRedClearanceSafeSegment(start, end, clearance);
   }
 
-  // --------------------------------------------------
-  // 绿色屏蔽区（可行动区轮廓外侧）净空判定：与红区共用同一套结构、同一个净空数值，
-  // 差别只在「禁的是多边形外侧」——所以这里额外要求点/线段落在可行动区内侧，
-  // 并沿用同一个无符号距离（到边界折线的距离）与同一套容差/松弛量。
-  // 只有我方单位使用这两个判定；敌军路线首个图内节点距绿边界仅 18.8 像素，
-  // 套上 19 像素绿净空会使其失效，因此敌军保持「仅红区」口径
-  // --------------------------------------------------
-  function isGreenClearanceSafePoint(x, y, clearance = PLAYER_GREEN_ZONE_CLEARANCE) {
-    const bit = getClearanceQueryBit(clearance, 'green');
-    const key = bit === 0 ? 0 : getPointQueryKey(x, y);
-    if (bit !== 0) {
-      const entry = pointQueryCache.get(key);
-      if (entry !== undefined && (entry & bit) !== 0) {
-        return (entry & bit << POINT_QUERY_RESULT_SHIFT) !== 0;
-      }
-    }
-    // 必须先判可行走：到边界折线的距离是无符号的，落在屏蔽区深处的点距离同样是正数，
-    // 只有 isWalkable（内含 pointInPolygon）才能把「在外侧」挡下来
-    let safe = isWalkable(x, y);
-    if (safe) {
-      const boundary = collisionRegions.walkableBoundary;
-      const needed = clearance - RED_CLEARANCE_TOLERANCE;
-      // 点到包围盒的距离是下界：下界已经安全就不必再算精确最近边。
-      // limit 传 needed：绿多边形很大，只关心「是否达到净空」时无需扫到精确最近点
-      safe = getPointBoundsLowerBound(x, y, getZoneBounds(boundary)) > needed ||
-        getZoneNearestEdge(boundary, x, y, needed).distance >= needed;
-    }
-    if (bit !== 0) {
-      // isWalkable 可能刚往同一个键写入可行走位，重新取一次再合并净空结论
-      const entry = pointQueryCache.get(key);
-      pointQueryCache.set(key, (entry || 0) | bit | (safe ? bit << POINT_QUERY_RESULT_SHIFT : 0));
-    }
-    return safe;
-  }
-
-  // 盾判定：我方单位必须同时满足红色与绿色两种屏蔽区的净空。
-  // 线段版直接复用红区版的全部前置检查（可行走、橙线、严格抽样），只再叠一条绿区距离
-  function isShieldClearanceSafePoint(x, y, clearance = PLAYER_RED_ZONE_CLEARANCE) {
-    return isRedClearanceSafePoint(x, y, clearance) &&
-      isGreenClearanceSafePoint(x, y, PLAYER_GREEN_ZONE_CLEARANCE);
-  }
-
-  function isShieldClearanceSafeSegment(
-    from,
-    to,
-    clearance = PLAYER_RED_ZONE_CLEARANCE,
-    strict = false,
-    slack = RED_CLEARANCE_PATH_SLACK
-  ) {
-    if (!isRedClearanceSafeSegment(from, to, clearance, strict, slack)) return false;
-    return isGreenClearanceSatisfied(from, to, PLAYER_GREEN_ZONE_CLEARANCE, slack);
-  }
-
-  // segmentSafe 供盾判定复用：默认仍是红区判定，因此现有调用点逐位不变
-  function isClearancePathSafe(
-    start,
-    path,
-    clearance = PLAYER_RED_ZONE_CLEARANCE,
-    strict = false,
-    segmentSafe = isRedClearanceSafeSegment
-  ) {
+  function isClearancePathSafe(start, path, clearance = PLAYER_RED_ZONE_CLEARANCE, strict = false) {
     if (!path || !path.length) return false;
     let previous = start;
     return path.every(point => {
-      const safe = segmentSafe(previous, point, clearance, strict);
+      const safe = isRedClearanceSafeSegment(previous, point, clearance, strict);
       previous = point;
       return safe;
     });
@@ -2869,39 +2536,11 @@
     });
   }
 
-  // 盾路由的环集合：全部红环，外加「确实需要」时才纳入的绿环。
-  // 绿环纳入的两个条件：直线本身就会贴住/切出绿边界（必须绕），或直线绕不开红区
-  // 且离绿边界已在 PLAYER_RED_ROUTE_RANGE 之内（绕行时很可能顺势贴到绿边）。
-  // 这是一次格子加速的线段查询，绝大多数指令不会把绿环（100+ 节点）塞进图里
-  function getShieldRouteRings(start, end, clearance = PLAYER_RED_ZONE_CLEARANCE) {
-    const rings = collisionRegions.redForbiddenZones.map(zone => ({ ...RED_SHIELD_RING, zone }));
-    const boundary = collisionRegions.walkableBoundary;
-    // 直线贴住/切出绿边界（到边界折线的距离不足净空）时必须把绿环纳入图。
-    // 这一判定与「绿区线段净空判定」完全同值，直接复用它的记忆化结果，省掉一次逐边求距
-    const greenUnsafe = !isGreenClearanceSatisfied(start, end, clearance, RED_CLEARANCE_PATH_SLACK);
-    const nearBoundary = greenUnsafe ||
-      (!isRedClearanceSafeSegment(start, end, clearance) &&
-        getZoneSegmentDistance(boundary, start, end) <= PLAYER_RED_ROUTE_RANGE);
-    if (nearBoundary) {
-      rings.push({ ...GREEN_SHIELD_RING, zone: boundary });
-      redPathStats.greenRouteCount += 1;
-      redPathStats.lastGreenNodes = getRedZoneContourNodes(boundary, clearance, GREEN_SHIELD_RING).length;
-    }
-    return rings;
-  }
-
   // A* 最短路：启发式取「到终点的直线距离」，可采纳且一致，因此结果与朴素 Dijkstra 完全一致
   // （同长度最优解之间的并列取舍可能不同）。节点数增长到 300+ 后，朴素 O(n²) 全图松弛会成为
   // 单次移动指令的主要卡顿来源，A* 只展开真正落在贴边绕行走廊内的节点，并利用已找到的完整路径
   // 长度作为上界剪掉不可能更优的分支，开销随之下降一个量级。
-  // segmentSafe 供盾判定复用：默认仍是红区判定，因此现有调用点逐位不变
-  function findShortestClearancePath(
-    nodes,
-    clearance = PLAYER_RED_ZONE_CLEARANCE,
-    strict = false,
-    upperBound = Infinity,
-    segmentSafe = isRedClearanceSafeSegment
-  ) {
+  function findShortestClearancePath(nodes, clearance = PLAYER_RED_ZONE_CLEARANCE, strict = false, upperBound = Infinity) {
     const count = nodes.length;
     const endIndex = count - 1;
     const end = nodes[endIndex];
@@ -2949,7 +2588,7 @@
         if (squared >= limit * limit) continue;
         const distance = currentDistance + Math.sqrt(squared);
         if (distance + heuristic[next] > best) continue;
-        if (!segmentSafe(nodes[current], nodes[next], clearance, strict)) continue;
+        if (!isRedClearanceSafeSegment(nodes[current], nodes[next], clearance, strict)) continue;
         distances[next] = distance;
         previous[next] = current;
         if (next === endIndex && distance < best) best = distance;
@@ -2981,7 +2620,7 @@
   // 候选点按「起点到该点 + 该点到终点」的直线距离升序评估：任意含该点的方案得分都不小于这个
   // 下界（弧长不短于弦长），一旦下界追平当前最优就无需再看后面的候选点——实测把每环上千次
   // 线段净空查询压到几十次。
-  function getRingWalkLeg(start, end, clearance, ring, segmentSafe = isRedClearanceSafeSegment) {
+  function getRingWalkLeg(start, end, clearance, ring) {
     const count = ring.length;
     if (count < 2) return null;
     const order = new Array(count);
@@ -3004,10 +2643,10 @@
       // 一旦下界追平当前最优，后面的候选点都不可能更优
       if (candidate.lowerBound >= bestScore) break;
       const point = ring[candidate.index];
-      const enterCost = segmentSafe(start, point, clearance)
+      const enterCost = isRedClearanceSafeSegment(start, point, clearance)
         ? Phaser.Math.Distance.Between(start.x, start.y, point.x, point.y)
         : Infinity;
-      const exitCost = segmentSafe(point, end, clearance)
+      const exitCost = isRedClearanceSafeSegment(point, end, clearance)
         ? Phaser.Math.Distance.Between(end.x, end.y, point.x, point.y)
         : Infinity;
       if (Number.isFinite(enterCost)) enter.push({ index: candidate.index, cost: enterCost });
@@ -3040,7 +2679,7 @@
     const nodes = [];
     for (let index = from; ; index = (index + direction + count) % count) {
       const previous = nodes[nodes.length - 1];
-      if (previous && !segmentSafe(previous, ring[index], clearance)) return null;
+      if (previous && !isRedClearanceSafeSegment(previous, ring[index], clearance)) return null;
       nodes.push(ring[index]);
       if (index === to || nodes.length >= count) break;
     }
@@ -3050,16 +2689,13 @@
   // 沿所有路线范围内红区轮廓行走的曲线路线：多个红区按离起点的远近依次贴边，
   // 每段都以最终终点为目标挑选入/出环点（所以每条使用的弦都经过安全校验，路径必然可行），
   // 行走段只走环上相邻采样点之间的安全弦。
-  function getRedContourWalkPath(start, end, clearance, rings, segmentSafe = isRedClearanceSafeSegment) {
+  function getRedContourWalkPath(start, end, clearance, rings) {
     if (!rings.length) return null;
     const ordered = rings.slice().sort((a, b) => getRingNearestDistance(a, start) - getRingNearestDistance(b, start));
     const path = [];
     let cursor = start;
     for (let n = 0; n < ordered.length; n++) {
-      // 剩余这段直线本身已经净空安全时，再贴后面任何一个环都不可能更短：
-      // 两块红区同时落在 PLAYER_RED_ROUTE_RANGE 内时，小环本可省去，这里直接收尾
-      if (segmentSafe(cursor, end, clearance)) break;
-      const leg = getRingWalkLeg(cursor, end, clearance, ordered[n], segmentSafe);
+      const leg = getRingWalkLeg(cursor, end, clearance, ordered[n]);
       if (!leg) continue;
       for (let i = 0; i < leg.nodes.length; i++) path.push(leg.nodes[i]);
       cursor = leg.nodes[leg.nodes.length - 1];
@@ -3079,22 +2715,22 @@
     return cost;
   }
 
-  // 曲线绕行路径：节点取所有路线范围内屏蔽环的等距轮廓采样点，
-  // 任意两节点之间必须保持安全净空，用最短路保证沿轮廓安全侧抵达终点。
-  // 红环与绿环共用这一份实现：routeRings 是环描述符数组，segmentSafe 是该环组合的线段判定
-  function getContourRoutePath(start, end, clearance, routeRings, segmentSafe) {
+  // 曲线绕行路径：节点取所有路线范围内红区的 38 像素等距轮廓采样点，
+  // 任意两节点之间必须保持安全净空，用最短路保证沿红区外沿抵达终点。
+  function getRedContourRoutePath(start, end, clearance = PLAYER_RED_ZONE_CLEARANCE) {
     if (!isWalkable(start.x, start.y) || !isWalkable(end.x, end.y)) return null;
-    if (!routeRings.length) return null;
+    const routeZones = getRedRouteZones(start, end);
+    if (!routeZones.length) return null;
     // 不按直线走廊裁剪节点：绕行所需的关键节点往往落在直线走廊之外
     // （例如贴着红区下沿绕过时，节点会超出直线 563 像素），裁剪会导致图断裂。
     const rings = [];
     const nodes = [];
     const seen = new Set();
-    routeRings.forEach(ring => {
-      const contour = getRedZoneContourNodes(ring.zone, clearance, ring);
-      if (!contour.length) return;
-      rings.push(contour);
-      contour.forEach(point => {
+    routeZones.forEach(zone => {
+      const ring = getRedZoneContourNodes(zone, clearance);
+      if (!ring.length) return;
+      rings.push(ring);
+      ring.forEach(point => {
         const key = `${Math.round(point.x * 4)}:${Math.round(point.y * 4)}`;
         if (seen.has(key)) return;
         seen.add(key);
@@ -3102,83 +2738,44 @@
       });
     });
     if (!nodes.length) return null;
-    // 先按「沿所有绕行范围内轮廓贴边行走」给出一条可行路线：
+    // 先按「沿所有绕行范围内红区的轮廓贴边行走」给出一条可行路线：
     // 它是曲线绕行的直接答案，同时给出最优路径长度的上界，交给下面的搜索剪枝。
-    const walkPath = getRedContourWalkPath(start, end, clearance, rings, segmentSafe);
+    const walkPath = getRedContourWalkPath(start, end, clearance, rings);
     let upperBound = Infinity;
     if (walkPath && walkPath.length) {
-      // 度量：贪心贴边路径长度（0 表示该路径不可用，即整环作废或存在断口）
-      redPathStats.lastGreedyLen = getClearancePathCost(start, walkPath);
-      if (isClearancePathSafe(start, walkPath, clearance, true, segmentSafe)) return walkPath;
+      if (isClearancePathSafe(start, walkPath, clearance, true)) return walkPath;
       // 严格校验没过时，只要松弛口径下成立就仍可作为搜索上界（上界必须来自真实可行路径）
-      if (isClearancePathSafe(start, walkPath, clearance, false, segmentSafe)) {
-        upperBound = getClearancePathCost(start, walkPath);
-      }
-    } else {
-      redPathStats.lastGreedyLen = 0;
+      if (isClearancePathSafe(start, walkPath, clearance, false)) upperBound = getClearancePathCost(start, walkPath);
     }
     const graph = [start, ...nodes, end];
-    const relaxedPath = findShortestClearancePath(graph, clearance, false, upperBound, segmentSafe);
+    const relaxedPath = findShortestClearancePath(graph, clearance, false, upperBound);
     if (relaxedPath && relaxedPath.length) {
-      if (isClearancePathSafe(start, relaxedPath, clearance, true, segmentSafe)) return relaxedPath;
-      const strictPath = findShortestClearancePath(graph, clearance, true, Infinity, segmentSafe);
+      if (isClearancePathSafe(start, relaxedPath, clearance, true)) return relaxedPath;
+      const strictPath = findShortestClearancePath(graph, clearance, true);
       if (strictPath && strictPath.length) return strictPath;
       return relaxedPath;
     }
     return null;
   }
 
-  // 红区曲线绕行路径（敌军与既有我方兜底路径在用）
-  function getRedContourRoutePath(start, end, clearance = PLAYER_RED_ZONE_CLEARANCE) {
-    return getContourRoutePath(
-      start, end, clearance,
-      getRedRouteZones(start, end).map(zone => ({ ...RED_SHIELD_RING, zone })),
-      isRedClearanceSafeSegment
-    );
-  }
-
-  // 盾曲线绕行路径（我方单位）：同时绕红区与绿屏蔽区
-  function getShieldContourRoutePath(start, end, clearance = PLAYER_RED_ZONE_CLEARANCE) {
-    return getContourRoutePath(
-      start, end, clearance, getShieldRouteRings(start, end, clearance), isShieldClearanceSafeSegment
-    );
-  }
-
-  // 我方单位寻路：全程用「盾」口径——同时判定红区与绿色屏蔽区的净空。
-  // 结构沿用原有红区版本：脱离安全带 → 直线 → 沿轮廓绕行 → 兜底重规划。
-  // 轮廓绕行分两段走：先按纯红区口径跑一遍（与改动前逐位一致），只有它确实切进绿屏蔽区时
-  // 才升级到「红环 + 绿环」的盾路由。纯红区场景因此逐位保持既有路径，
-  // 绿环（一百多个节点）也只在真正需要时才进入 A* 图
   function getShortestPlayerPath(start, end, allowEscape = true) {
     if (!isWalkable(start.x, start.y) || !isWalkable(end.x, end.y)) return null;
     // 起点已被安全带包住（例如屏蔽区被改到脚下）：先脱离安全带，再从脱离点重新规划
-    if (allowEscape && !isShieldClearanceSafePoint(start.x, start.y, PLAYER_RED_ZONE_CLEARANCE)) {
-      const escape = correctPointIntoShieldClearance(start, PLAYER_RED_ZONE_CLEARANCE);
+    if (allowEscape && !isRedClearanceSafePoint(start.x, start.y, PLAYER_RED_ZONE_CLEARANCE)) {
+      const escape = correctPointOutOfRedClearance(start, PLAYER_RED_ZONE_CLEARANCE);
       if (Phaser.Math.Distance.Between(start.x, start.y, escape.x, escape.y) <= 0.05) return null;
       const remaining = getShortestPlayerPath(escape, end, false);
       return remaining && remaining.length ? [escape, ...remaining] : [escape];
     }
-    // 终点本身不满足盾净空时直接判无路：线段到边界的距离不会超过端点到边界的距离，
-    // 因此任何以它为末端的线段都不可能安全。少了这一步，注定失败的规划仍会在
-    // 两百多个候选节点上跑一遍完整的 A*（贴绿边的图规模最大时单次可达数十毫秒）
-    if (!isShieldClearanceSafePoint(end.x, end.y, PLAYER_RED_ZONE_CLEARANCE - RED_CLEARANCE_PATH_SLACK)) {
-      return null;
-    }
-    // 直线既不穿越红区、也不侵入安全带、又不切进绿屏蔽区时，直线本身就是最短路径
-    if (isShieldClearanceSafeSegment(start, end, PLAYER_RED_ZONE_CLEARANCE, true)) return [end];
-    // 第一段：纯红区口径的轮廓绕行。它同时满足盾净空时直接采用（纯红区场景与改动前逐位一致）
-    const redPath = getRedContourRoutePath(start, end, PLAYER_RED_ZONE_CLEARANCE);
-    if (redPath && redPath.length &&
-      isClearancePathSafe(start, redPath, PLAYER_RED_ZONE_CLEARANCE, true, isShieldClearanceSafeSegment)) {
-      return redPath;
-    }
-    // 第二段：红区口径的路线会切进绿屏蔽区，改用盾路由（红环 + 绿环，能沿绿边界绕行）
-    const contourPath = getShieldContourRoutePath(start, end, PLAYER_RED_ZONE_CLEARANCE);
+    // 直线既不穿越红区、也不侵入 38 像素安全带时，直线本身就是最短路径
+    if (isRedClearanceSafeSegment(start, end, PLAYER_RED_ZONE_CLEARANCE, true)) return [end];
+    // 否则不取直线距离，改为沿路线范围内所有红区的等距轮廓曲线抵达终点
+    const contourPath = getRedContourRoutePath(start, end, PLAYER_RED_ZONE_CLEARANCE);
     if (contourPath && contourPath.length) return contourPath;
-    // 两条轮廓路线都跑过了，兜底方案跳过重复的那一遍
+    // 同一组参数刚刚已经跑过轮廓规划，这里让兜底方案跳过重复的那一遍
     const fallbackPath = getShortestShieldedPath(start, end, false, PLAYER_RED_ZONE_CLEARANCE, true);
     if (fallbackPath && fallbackPath.length &&
-      isClearancePathSafe(start, fallbackPath, PLAYER_RED_ZONE_CLEARANCE, true, isShieldClearanceSafeSegment)) {
+      isClearancePathSafe(start, fallbackPath, PLAYER_RED_ZONE_CLEARANCE, true)) {
       return fallbackPath;
     }
     return null;
@@ -3241,61 +2838,30 @@
     return bestIndex;
   }
 
-  // 沿轮廓按给定方向从一个索引绕到另一个索引的折线长度。
-  // 用环绕前缀弧长 O(1) 求出：原先要逐段累加，每次贴边滑动都要跑两遍全环（数百段），
-  // 是逐帧逐单位调用量较大的一处。fromIndex === toIndex 时与旧实现一致返回整圈长度
-  function getContourArcLength(contour, fromIndex, toIndex, direction, arcPrefix) {
+  // 沿轮廓按给定方向从一个索引绕到另一个索引的折线长度
+  function getContourArcLength(contour, fromIndex, toIndex, direction) {
     const count = contour.length;
-    const total = arcPrefix[count];
-    if (!(total > 0)) return 0;
-    if (fromIndex === toIndex) return total;
-    const span = direction > 0
-      ? arcPrefix[toIndex] - arcPrefix[fromIndex]
-      : arcPrefix[fromIndex] - arcPrefix[toIndex];
-    return ((span % total) + total) % total;
+    let length = 0;
+    let index = fromIndex;
+    for (let step = 0; step < count; step++) {
+      const next = (index + direction + count) % count;
+      length += Phaser.Math.Distance.Between(
+        contour[index].x, contour[index].y, contour[next].x, contour[next].y
+      );
+      index = next;
+      if (index === toIndex) break;
+    }
+    return length;
   }
 
-  // 贴边滑动用的环列表：红环在前、绿环在后（红环顺序不能变，既有行为依赖它）。
-  // 只有我方单位会带绿环；绿环带 gated 标记，用一趟「先探最近边、远则跳过」的前置门
-  // 免掉对数百个绿轮廓采样点的最近点扫描——绿多边形占全图一半，内部点距边界可达数百像素。
-  // 环列表只由碰撞区域版本决定，缓存复用，避免逐帧逐单位新建对象
-  let shieldSlideRingsCache = { version: -1, red: null, shield: null };
-  function getShieldSlideRings(includeGreen) {
-    if (shieldSlideRingsCache.version !== collisionRegionVersion) {
-      shieldSlideRingsCache = { version: collisionRegionVersion, red: null, shield: null };
-    }
-    const key = includeGreen ? 'shield' : 'red';
-    let rings = shieldSlideRingsCache[key];
-    if (!rings) {
-      rings = collisionRegions.redForbiddenZones.map(zone => ({ ...RED_SHIELD_RING, zone }));
-      if (includeGreen) {
-        rings.push({ ...GREEN_SHIELD_RING, zone: collisionRegions.walkableBoundary, gated: true });
-      }
-      shieldSlideRingsCache[key] = rings;
-    }
-    return rings;
-  }
-
-  // 沿屏蔽环等距轮廓滑动：以环的安全侧外沿作为最终判断依据，只朝更靠近目标的一侧前进。
+  // 沿红区等距轮廓滑动：以红区外沿作为最终判断依据，只朝更靠近目标的一侧前进。
   // 转向点比安全带再外扩 PLAYER_RED_STEER_BIAS，抵消轮廓折线弦长带来的亚像素内切，
-  // 保证贴边行走时的实际净空不会跌破安全带宽度。
-  // 红环与绿环共用这一份实现：环描述符给出多边形、偏移符号与净空判定，其余几何完全一致
-  function slideAlongShieldContour(origin, waypoint, budget, clearance, rings, segmentSafe) {
-    // 度量：本函数是逐帧逐单位调用量最大的一处，单独统计调用次数与耗时
-    const slideStartedAt = performance.now();
-    redPathStats.slideCalls += 1;
+  // 保证贴边行走时的实际净空不会跌破安全带宽度
+  function slideAlongRedContour(origin, waypoint, budget, clearance = PLAYER_RED_ZONE_CLEARANCE) {
     const walkClearance = clearance + PLAYER_RED_STEER_BIAS;
-    const slideRange = clearance + PLAYER_RED_SLIDE_RANGE;
     let best = null;
-    rings.forEach(ring => {
-      // 前置门：环轮廓点到原点的距离恒不小于「原点到环多边形的距离 − 偏移宽度」，
-      // 所以原点到环多边形已超过 偏移宽度 + 滑动范围 时，最近轮廓点必然落在滑动范围之外。
-      // 查询带上界，命中即提前退出，代价远低于对数百个轮廓点逐一求距离
-      if (ring.gated &&
-        getZoneNearestEdge(ring.zone, origin.x, origin.y, walkClearance + slideRange).distance >
-          walkClearance + slideRange) return;
-      const entry = getRedZoneContourEntry(ring.zone, walkClearance, ring.offsetSign, ring.pointSafe, ring.correct);
-      const contour = entry.points;
+    collisionRegions.redForbiddenZones.forEach(zone => {
+      const contour = getRedZoneContour(zone, walkClearance);
       if (contour.length < 2) return;
       let nearestIndex = -1;
       let nearestDistance = Infinity;
@@ -3306,24 +2872,20 @@
           nearestIndex = index;
         }
       });
-      if (nearestIndex < 0 || nearestDistance > slideRange) return;
+      if (nearestIndex < 0 || nearestDistance > clearance + PLAYER_RED_SLIDE_RANGE) return;
       // 起点只要求满足真实安全带宽度：轮廓点本身按 walkClearance（再外扩一个偏置）生成，
       // 弦长误差由该偏置抵消。若这里也用 walkClearance 判定，站位刚好落在安全带边界上时
       // 会被误判为不安全，单位只能逐帧空转、蹭着红区慢慢挪动
-      if (!segmentSafe(
+      if (!isRedClearanceSafeSegment(
         origin, contour[nearestIndex], walkClearance, false, PLAYER_RED_STEER_BIAS + RED_CLEARANCE_TOLERANCE
       )) return;
       if (!best || nearestDistance < best.distance) {
-        best = { entry, contour, nearestIndex, distance: nearestDistance };
+        best = { contour, nearestIndex, distance: nearestDistance };
       }
     });
-    if (!best) {
-      redPathStats.slideMs += performance.now() - slideStartedAt;
-      return null;
-    }
+    if (!best) return null;
 
     const contour = best.contour;
-    const arcPrefix = best.entry.arcPrefix;
     const count = contour.length;
     // 起点投影到轮廓折线上（而不是吸附到最近的采样点）：采样间距 24 像素，
     // 若每帧都吸附回采样点，本帧的沿边推进量会被吸附位移抵消，单位只会在采样点附近来回抖动
@@ -3331,9 +2893,9 @@
     // 绕行方向按「沿轮廓走到离终点最近的那一点，哪边弧长更短」判定：
     // 只看相邻采样点会随单位越过目标垂足来回翻转，同样会让单位贴边原地踏步
     const targetIndex = getNearestContourIndex(contour, waypoint);
-    const forwardLength = getContourArcLength(contour, projection.index, targetIndex, 1, arcPrefix);
-    const backwardLength = getContourArcLength(contour, projection.index, targetIndex, -1, arcPrefix);
-    const direction = backwardLength < forwardLength * (1 - PLAYER_RED_SLIDE_HYSTERESIS) ? -1 : 1;
+    const forwardLength = getContourArcLength(contour, projection.index, targetIndex, 1);
+    const backwardLength = getContourArcLength(contour, projection.index, targetIndex, -1);
+    const direction = backwardLength < forwardLength ? -1 : 1;
 
     let index = direction > 0 ? (projection.index + 1) % count : projection.index;
     let current = { x: projection.x, y: projection.y };
@@ -3349,43 +2911,22 @@
         };
         break;
       }
-      if (!segmentSafe(current, target, walkClearance)) break;
+      if (!isRedClearanceSafeSegment(current, target, walkClearance)) break;
       current = target;
       remaining -= distance;
       index = (index + direction + count) % count;
     }
-    if (Phaser.Math.Distance.Between(origin.x, origin.y, current.x, current.y) < 0.2) {
-      redPathStats.slideMs += performance.now() - slideStartedAt;
-      return null;
-    }
-    const slid = segmentSafe(
+    if (Phaser.Math.Distance.Between(origin.x, origin.y, current.x, current.y) < 0.2) return null;
+    return isRedClearanceSafeSegment(
       origin, current, walkClearance, false, PLAYER_RED_STEER_BIAS + RED_CLEARANCE_TOLERANCE
     ) ? current : null;
-    redPathStats.slideMs += performance.now() - slideStartedAt;
-    if (slid) redPathStats.slideHits += 1;
-    return slid;
   }
 
-  // 红区贴边滑动：既有行为，环列表只含红环
-  function slideAlongRedContour(origin, waypoint, budget, clearance = PLAYER_RED_ZONE_CLEARANCE) {
-    return slideAlongShieldContour(
-      origin, waypoint, budget, clearance, getShieldSlideRings(false), isRedClearanceSafeSegment
-    );
-  }
-
-  // 盾贴边滑动：同时沿红环与绿环贴边（我方单位用）
-  function slideAlongShieldRing(origin, waypoint, budget, clearance = PLAYER_RED_ZONE_CLEARANCE) {
-    return slideAlongShieldContour(
-      origin, waypoint, budget, clearance, getShieldSlideRings(true), isShieldClearanceSafeSegment
-    );
-  }
-
-  // 逐帧转向：先直行，其次推离到安全带之外，最后沿轮廓滑动；都不行则交给上层重新规划。
-  // 红区与绿区共用这一份实现，差别全部收进四个策略参数（点判定 / 推离 / 线段判定 / 贴边滑动）
-  function getSteeringTargetWithin(origin, waypoint, budget, clearance, pointSafe, correct, segmentSafe, slide) {
-    if (!pointSafe(origin.x, origin.y, clearance)) {
+  // 逐帧转向：先直行，其次推离到安全带之外，最后沿红区外沿滑动；都不行则交给上层重新规划
+  function getPlayerSteeringTarget(origin, waypoint, budget, clearance = PLAYER_RED_ZONE_CLEARANCE) {
+    if (!isRedClearanceSafePoint(origin.x, origin.y, clearance)) {
       // 自身已在安全带内：优先朝安全带外脱离，避免任意朝向都被判定为不安全而永久卡住
-      const escape = correct(origin, clearance + PLAYER_RED_STEER_BIAS);
+      const escape = correctPointOutOfRedClearance(origin, clearance + PLAYER_RED_STEER_BIAS);
       const distance = Phaser.Math.Distance.Between(origin.x, origin.y, escape.x, escape.y);
       if (distance > 0.05) {
         const ratio = Math.min(1, budget / distance);
@@ -3398,36 +2939,20 @@
     const totalDistance = Phaser.Math.Distance.Between(origin.x, origin.y, waypoint.x, waypoint.y);
     if (totalDistance <= budget) {
       const arrival = { x: waypoint.x, y: waypoint.y };
-      if (segmentSafe(origin, arrival, clearance)) return arrival;
+      if (isRedClearanceSafeSegment(origin, arrival, clearance)) return arrival;
     }
     const ratio = totalDistance > 0 ? Math.min(1, budget / totalDistance) : 0;
     const desired = {
       x: origin.x + (waypoint.x - origin.x) * ratio,
       y: origin.y + (waypoint.y - origin.y) * ratio
     };
-    if (segmentSafe(origin, desired, clearance)) return desired;
-    const corrected = correct(desired, clearance);
+    if (isRedClearanceSafeSegment(origin, desired, clearance)) return desired;
+    const corrected = correctPointOutOfRedClearance(desired, clearance);
     if (Phaser.Math.Distance.Between(desired.x, desired.y, corrected.x, corrected.y) > 0.05 &&
-      segmentSafe(origin, corrected, clearance)) {
+      isRedClearanceSafeSegment(origin, corrected, clearance)) {
       return corrected;
     }
-    return slide(origin, waypoint, budget, clearance);
-  }
-
-  // 红区转向：既有行为（敌军与本阶段尚未切换的我方调用点仍在用）
-  function getPlayerSteeringTarget(origin, waypoint, budget, clearance = PLAYER_RED_ZONE_CLEARANCE) {
-    return getSteeringTargetWithin(
-      origin, waypoint, budget, clearance,
-      isRedClearanceSafePoint, correctPointOutOfRedClearance, isRedClearanceSafeSegment, slideAlongRedContour
-    );
-  }
-
-  // 盾转向：我方单位用，同时判定红、绿两种屏蔽区并沿两者的轮廓贴边
-  function getShieldSteeringTarget(origin, waypoint, budget, clearance = PLAYER_RED_ZONE_CLEARANCE) {
-    return getSteeringTargetWithin(
-      origin, waypoint, budget, clearance,
-      isShieldClearanceSafePoint, correctPointIntoShieldClearance, isShieldClearanceSafeSegment, slideAlongShieldRing
-    );
+    return slideAlongRedContour(origin, waypoint, budget, clearance);
   }
 
   function getShortestShieldedPath(
@@ -4417,8 +3942,8 @@
       }
       const waypoint = path.length ? path[0] : { x: charge.target.x, y: charge.target.y };
       const budget = DEATH_CHARGE_SPEED * Math.max(0, delta) / 1000;
-      // 与点击移动用同一套净空标准（红区 + 绿屏蔽区）：冲锋过程同样不会切进屏蔽区
-      const steered = getShieldSteeringTarget({ x: charge.x, y: charge.y }, waypoint, budget);
+      // 与点击移动用同一套净空标准（38 像素安全带）：冲锋过程同样不会切进屏蔽区
+      const steered = getPlayerSteeringTarget({ x: charge.x, y: charge.y }, waypoint, budget);
       if (steered) {
         // 曲线行走时朝向上取「本帧实际落点」而不是路径点，避免贴红区绕行时朝向乱甩
         if (Math.abs(steered.x - charge.x) > 0.01) charge.facingLeft = steered.x < charge.x;
@@ -5858,6 +5383,7 @@
     squad.morphProgress = 0;
     squad.squeezed = false;
     squad.freeActive = false;
+    squad.regroup = false;
     squad.slotSwapped = true;
     squad.forward.x = 0;
     squad.forward.y = -1;
@@ -6000,18 +5526,19 @@
     return null;
   }
 
-  // 可行动区轮廓内侧的最近落点：轮廓上的点落在边界上（pointInPolygon 的结论二义），
-  // 沿外法线反向推一点即为区内。推进深度必须越过绿净空带，否则落点仍然落在净空带里、
-  // 会被盾判定否决，点击绿屏蔽区就变成「走到了但站不住」
+  // 可行动区轮廓内侧的最近可行走落点：轮廓上的点落在边界上（pointInPolygon 的结论二义），
+  // 沿外法线反向推一点即为区内，逐个距离试到第一个可行走落点。
+  // 这一支只在「最近轮廓点朝内侧推进也站不住」时才走到，属于个别退化点击，
+  // 采样间距取粗一些，避免为一次点击做整圈高密度探测
   function findWalkableShieldSeat(x, y) {
     const boundary = collisionRegions.walkableBoundary;
     const samples = samplePolygonBoundaryOrdered(boundary, x, y, WALKABLE_SHIELD_SCAN_STEP);
     for (let index = 0; index < samples.length; index++) {
       const sample = samples[index];
       const normal = getOutwardNormal(boundary, sample.edgeIndex);
-      for (let depth = 2; depth <= PLAYER_GREEN_ZONE_CLEARANCE + 16; depth += 2) {
+      for (let depth = 2; depth <= 12; depth += 2) {
         const point = { x: sample.x - normal.x * depth, y: sample.y - normal.y * depth };
-        if (isGreenClearanceSafePoint(point.x, point.y)) return point;
+        if (isWalkable(point.x, point.y)) return point;
       }
     }
     return null;
@@ -6021,7 +5548,7 @@
   // 红色屏蔽区取自身边缘外推 38 像素（结果是贴边行走但不卡进屏蔽区），
   // 绿色隔离区取可行动区轮廓内侧（轮廓内侧就是可站立的地面）。
   // 点到哪块屏蔽区就贴哪块：点进红区时只在该红区边缘上找落点，不再和可行动区轮廓混选
-  function getShieldEdgeDestination(x, y) {
+  function getShieldEdgeDestination(x, y, anchor) {
     const offset = PLAYER_RED_ZONE_CLEARANCE + RED_CONTOUR_MARGIN;
     let best = null;
     collisionRegions.redForbiddenZones.forEach(zone => {
@@ -6041,11 +5568,11 @@
       if (seat && (!best || seat.distance < best.distance)) best = seat;
     });
     if (best) return best.point;
-    // 点击绿色隔离区（可行动区轮廓之外）：终点定在轮廓内侧、且离边界留足绿净空的最近落点
+    // 点击绿色隔离区（可行动区轮廓之外）：终点定在轮廓内侧离点击点最近的可行走落点
     const walkedEdge = getPolygonNearestEdgePoint(collisionRegions.walkableBoundary, x, y);
     if (walkedEdge) {
-      const point = correctPointIntoGreenClearance(walkedEdge.point, offset);
-      if (isWalkable(point.x, point.y) && isGreenClearanceSafePoint(point.x, point.y)) return point;
+      const point = correctPointIntoWalkable(walkedEdge.point, anchor);
+      if (isWalkable(point.x, point.y)) return point;
     }
     return findWalkableShieldSeat(x, y);
   }
@@ -6060,9 +5587,6 @@
     squad.moveProgress.closestDistance = Infinity;
     squad.moveProgress.stalledSince = Number.isFinite(now) ? now : 0;
     squad.moveProgress.retries = 0;
-    // replanKey / replanAt 是成对的限流状态，必须一起清：
-    // 只清 replanKey 时，上一段移动留下的冷却会拖到下一次移动指令上（最多挡住 260ms 的重规划）
-    squad.replanAt = 0;
   }
 
   // 结束当前移动指令：曲线路径一并清空，队伍就地停下（不瞬移）。
@@ -6071,7 +5595,6 @@
     squad.moveTarget = null;
     squad.detourPath = [];
     squad.replanKey = null;
-    squad.replanAt = 0;
     squad.unit.isMoving = false;
     squad.unit.body.stop();
     resetPlayerMoveProgress(squad);
@@ -6084,22 +5607,6 @@
       nodes: squad.detourPath.length,
       distance: waypoint ? Math.hypot(waypoint.x - squad.unit.x, waypoint.y - squad.unit.y) : 0
     };
-  }
-
-  // 执行期的路径节点收敛：从路径尾部往前找第一个「当前位置可安全直达」的节点，
-  // 丢掉它之前的全部节点并返回它（路径末节点就是最终终点，因此最坏情况收敛到终点）。
-  // 用于转向失败时的兜底：原先直接改为朝最终终点求转向，而绕行途中最终终点位于轮廓的另一侧，
-  // 方向与当前拐点相反，会把单位往回拽、形成贴边来回横跳；改为先收敛到可直达的路径节点，
-  // 方向始终沿路径前进。返回 null 表示路径为空或没有任何可直达节点
-  function getReachablePathNode(squad, origin, clearance = PLAYER_RED_ZONE_CLEARANCE) {
-    const path = squad.detourPath;
-    for (let index = path.length - 1; index >= 0; index--) {
-      if (isShieldClearanceSafeSegment(origin, path[index], clearance)) {
-        if (index > 0) path.splice(0, index);
-        return path[0];
-      }
-    }
-    return null;
   }
 
   // 移动进度看门狗：返回 true 表示本次移动已按「无法再靠近终点」结束。
@@ -6132,10 +5639,7 @@
     if (squad.moveProgress.retries < PLAYER_MOVE_STALL_RETRIES) {
       squad.moveProgress.retries += 1;
       squad.moveProgress.stalledSince = time;
-      const replanOrigin = { x: squad.unit.x, y: squad.unit.y };
-      const replanStartedAt = performance.now();
-      const replanned = getShortestPlayerPath(replanOrigin, squad.moveTarget);
-      recordRedPlan(replanOrigin, squad.moveTarget, replanned, replanStartedAt);
+      const replanned = getShortestPlayerPath({ x: squad.unit.x, y: squad.unit.y }, squad.moveTarget);
       if (replanned && replanned.length) {
         squad.detourPath = replanned;
         squad.replanKey = null;
@@ -6172,10 +5676,7 @@
 
   // 完成一条排队的规划：路径为空说明直线与轮廓绕行都走不通，按「无法绕行」收队
   function applyPlayerPathOrder(scene, squad, destination, time) {
-    const planOrigin = { x: squad.unit.x, y: squad.unit.y };
-    const planStartedAt = performance.now();
-    const planned = getShortestPlayerPath(planOrigin, destination);
-    recordRedPlan(planOrigin, destination, planned, planStartedAt);
+    const planned = getShortestPlayerPath({ x: squad.unit.x, y: squad.unit.y }, destination);
     if (!planned || !planned.length) {
       showCombatText(scene, destination.x, destination.y, '红色屏蔽区无法安全绕行', '#ff6666');
       finishPlayerMoveOrder(squad);
@@ -6223,17 +5724,17 @@
     if (!isWalkable(destination.x, destination.y)) {
       // 点到红色屏蔽区或绿色隔离区：不再提示无法进入、也不再拒绝指令，
       // 而是做一次判定，把终点定在离点击点最近的那条屏蔽区边缘上
-      const edge = getShieldEdgeDestination(x, y);
+      const edge = getShieldEdgeDestination(x, y, squad.unit);
       if (!edge) {
         showCombatText(scene, destination.x, destination.y, '无法进入该区域', '#ff6666');
         return false;
       }
       destination.set(edge.x, edge.y);
     }
-    // 终点落在安全带或绿净空带内时，把终点吸附到屏蔽区外沿的安全位置，
+    // 终点落在 38 像素安全带内时，把终点吸附到红区外沿的安全位置，
     // 而不是把可到达的点击误判为无法绕行
-    if (!isShieldClearanceSafePoint(destination.x, destination.y, PLAYER_RED_ZONE_CLEARANCE)) {
-      const snapped = correctPointIntoShieldClearance(
+    if (!isRedClearanceSafePoint(destination.x, destination.y, PLAYER_RED_ZONE_CLEARANCE)) {
+      const snapped = correctPointOutOfRedClearance(
         destination,
         PLAYER_RED_ZONE_CLEARANCE + RED_CONTOUR_MARGIN
       );
@@ -6418,23 +5919,20 @@
     return t * t * (3 - 2 * t);
   }
 
-  // 小队是否已贴到屏蔽区边缘（红区或绿色屏蔽区）：以净空宽度为基准再放宽给定范围。
-  // 进入与退出传入不同的范围即可形成迟滞，贴边行走时判定不会来回抖动。
-  // 绿边界查询带上界：绿多边形内部点距边界可达数百像素，带上界的查询命中即提前退出
-  function isPointAtShieldEdge(x, y, extraRange) {
+  // 小队是否已贴到红色屏蔽区边缘：以 38 像素安全带为基准再放宽给定范围。
+  // 进入与退出传入不同的范围即可形成迟滞，贴边行走时判定不会来回抖动
+  function isPointAtRedEdge(x, y, extraRange) {
     const range = extraRange === undefined ? PLAYER_SQUAD_EDGE_RANGE : extraRange;
     let nearest = Infinity;
     collisionRegions.redForbiddenZones.forEach(zone => {
       const distance = getZonePointDistance(zone, x, y);
       if (distance < nearest) nearest = distance;
     });
-    if (nearest <= PLAYER_RED_ZONE_CLEARANCE + range) return true;
-    const limit = PLAYER_GREEN_ZONE_CLEARANCE + range;
-    return getZoneNearestEdge(collisionRegions.walkableBoundary, x, y, limit).distance <= limit;
+    return nearest <= PLAYER_RED_ZONE_CLEARANCE + range;
   }
 
-  function isPlayerSquadAtShieldEdge(squad, extraRange) {
-    return isPointAtShieldEdge(squad.unit.x, squad.unit.y, extraRange);
+  function isPlayerSquadAtRedEdge(squad, extraRange) {
+    return isPointAtRedEdge(squad.unit.x, squad.unit.y, extraRange);
   }
 
   // 行进方向：朝当前行进目标平滑转向；平滑过程中朝向反转会退化到零向量，此时直接取目标朝向
@@ -6597,7 +6095,7 @@
         Phaser.Math.Clamp(distance / PLAYER_SQUAD_REGROUP_CATCHUP_DISTANCE, 0, 1);
       const budget = speed * step / 1000;
       const origin = { x: member.freeX, y: member.freeY };
-      const steered = getShieldSteeringTarget(origin, goal, budget);
+      const steered = getPlayerSteeringTarget(origin, goal, budget);
       if (steered) {
         member.freeX = steered.x;
         member.freeY = steered.y;
@@ -6703,47 +6201,46 @@
     return { x: point.x, y: point.y };
   }
 
-  // 位置修正：把队员推回屏蔽区（红区与绿屏蔽区）的净空带之外，并保证各自仍落在可行走区域内。
-  // 这是「每名队员的独立碰撞体」的判定核心：三人各自过自己的净空与地形，互不代劳
+  // 位置修正：把队员推回红色屏蔽区的 38 像素安全带之外，并保证各自仍落在可行走区域内。
+  // 这是「每名队员的独立碰撞体」的判定核心：三人各自过自己的安全带与地形，互不代劳
   function clampPlayerSquadPoints(squad, positions) {
     const anchor = { x: squad.unit.x, y: squad.unit.y };
     positions.forEach(point => {
-      const outOfShield = correctPointIntoShieldClearance(point, PLAYER_RED_ZONE_CLEARANCE);
-      const corrected = correctPointIntoWalkable(outOfShield, anchor);
+      const outOfRed = correctPointOutOfRedClearance(point, PLAYER_RED_ZONE_CLEARANCE);
+      const corrected = correctPointIntoWalkable(outOfRed, anchor);
       point.x = corrected.x;
       point.y = corrected.y;
     });
   }
 
-  // 单个队员越出屏蔽区净空带的深度：0 表示已在净空带之外
-  function getPlayerSquadShieldViolation(point) {
-    const corrected = correctPointIntoShieldClearance(point, PLAYER_RED_ZONE_CLEARANCE);
+  // 单个队员越出红区安全带的深度：0 表示已在安全带之外
+  function getPlayerSquadRedViolation(point) {
+    const corrected = correctPointOutOfRedClearance(point, PLAYER_RED_ZONE_CLEARANCE);
     return Math.hypot(corrected.x - point.x, corrected.y - point.y);
   }
 
-  function getWorstPlayerSquadShieldViolation(positions) {
+  function getWorstPlayerSquadRedViolation(positions) {
     let worst = 0;
     positions.forEach(point => {
-      const violation = getPlayerSquadShieldViolation(point);
+      const violation = getPlayerSquadRedViolation(point);
       if (violation > worst) worst = violation;
     });
     return worst;
   }
 
-  // 队员与屏蔽区边缘保持净空时优先整体平移：刚体平移不改变队员间距，
+  // 队员与红区边缘保持 38 像素距离时优先整体平移：刚体平移不改变队员间距，
   // 因此自由行走时的横向展开量、纵队时队员之间的最小隔离距离都能严格保持；
-  // 只有在整体平移不收敛时才退回到逐点推回（此时屏蔽区安全优先于间距）。
-  // 对红环与绿环一起求违例：贴绿边时同样整队刚性平移，正是沿绿边界行走想要的形态
-  function fitPlayerSquadToShieldClearance(squad, positions) {
+  // 只有在整体平移不收敛时才退回到逐点推回（此时红区安全优先于间距）
+  function fitPlayerSquadToRedClearance(squad, positions) {
     let best = positions.map(point => ({ x: point.x, y: point.y }));
-    let bestViolation = getWorstPlayerSquadShieldViolation(positions);
+    let bestViolation = getWorstPlayerSquadRedViolation(positions);
     for (let pass = 0; pass < PLAYER_SQUAD_SEPARATION_PASSES && bestViolation > RED_CLEARANCE_TOLERANCE; pass++) {
       // 以需要修正幅度最大的队员为准，整队一起平移
       let shiftX = 0;
       let shiftY = 0;
       let shiftLength = 0;
       positions.forEach(point => {
-        const corrected = correctPointIntoShieldClearance(point, PLAYER_RED_ZONE_CLEARANCE);
+        const corrected = correctPointOutOfRedClearance(point, PLAYER_RED_ZONE_CLEARANCE);
         const dx = corrected.x - point.x;
         const dy = corrected.y - point.y;
         const length = Math.hypot(dx, dy);
@@ -6757,7 +6254,7 @@
         point.x += shiftX;
         point.y += shiftY;
       });
-      const violation = getWorstPlayerSquadShieldViolation(positions);
+      const violation = getWorstPlayerSquadRedViolation(positions);
       if (violation < bestViolation) {
         bestViolation = violation;
         best = positions.map(point => ({ x: point.x, y: point.y }));
@@ -6880,12 +6377,12 @@
     squad.crowdY += (targetY - squad.crowdY) * PLAYER_CROSS_SQUAD_LERP;
   }
 
-  // 队员能否直接沿直线走回自己的站位：直线不侵入屏蔽区净空带、且整条直线都在可行走区域内才算安全。
-  // 净空判定用 slack = 0，和运行时「绝不贴进净空带以内」的要求保持一致。
+  // 队员能否直接沿直线走回自己的站位：直线不侵入红区安全带、且整条直线都在可行走区域内才算安全。
+  // 安全带判定用 slack = 0，和运行时「绝不贴进安全带以内」的要求保持一致。
   // clearance 允许调用方收紧要求（归位判定用更宽的通道形成迟滞死区）
   function isPlayerMemberDirectRouteSafe(originX, originY, target, clearance = PLAYER_RED_ZONE_CLEARANCE) {
-    if (!isShieldClearanceSafePoint(target.x, target.y)) return false;
-    return isShieldClearanceSafeSegment(
+    if (!isRedClearanceSafePoint(target.x, target.y)) return false;
+    return isRedClearanceSafeSegment(
       { x: originX, y: originY },
       target,
       clearance,
@@ -6926,8 +6423,8 @@
       ? member.returnPath[member.returnPath.length - 2]
       : origin;
     if (goalMoved && member.returnPath.length &&
-      isShieldClearanceSafePoint(target.x, target.y) &&
-      isShieldClearanceSafeSegment(tailFrom, target, PLAYER_RED_ZONE_CLEARANCE, true)) {
+      isRedClearanceSafePoint(target.x, target.y) &&
+      isRedClearanceSafeSegment(tailFrom, target, PLAYER_RED_ZONE_CLEARANCE, true)) {
       member.returnPath[member.returnPath.length - 1] = { x: target.x, y: target.y };
       member.returnGoal = { x: target.x, y: target.y };
     } else if ((goalMoved || !member.returnPath.length) && member.returnReplanIn <= 0 &&
@@ -6950,9 +6447,9 @@
       member.returnPath.shift();
     }
     const waypoint = member.returnPath[0];
-    const steered = getShieldSteeringTarget(origin, waypoint, budget);
+    const steered = getPlayerSteeringTarget(origin, waypoint, budget);
     if (!steered) {
-      // 朝向被净空带挡住：丢掉当前路径并进入冷却，交给上层沿屏蔽区轮廓滑动带出去
+      // 朝向被安全带挡住：丢掉当前路径并进入冷却，交给上层沿红区轮廓滑动带出去
       resetPlayerMemberReturn(member);
       member.returnReplanIn = PLAYER_MEMBER_RETURN_REPLAN_COOLDOWN;
       return null;
@@ -6962,26 +6459,26 @@
       PLAYER_MEMBER_RETURN_WAYPOINT_RADIUS) {
       member.returnPath.shift();
     }
-    // 落点净空：轮廓折线的弦长误差会让转向落点比净空带略微贴里一点，
-    // 所以先按「推到净空带之外」修正（修正后是足额净空），修正结果再过一次
+    // 落点净空：轮廓折线的弦长误差会让转向落点比安全带略微贴里一点，
+    // 所以先按「推到安全带之外」修正（修正后是足额净空），修正结果再过一次
     // 与转向函数一致的线段判定，避免推离方向把落点甩到屏蔽区另一侧。
     // 这里不能只用严格判定否决落点：一旦否决，上层会退回直行，队员就会穿进屏蔽区
-    const landing = isShieldClearanceSafePoint(steered.x, steered.y)
+    const landing = isRedClearanceSafePoint(steered.x, steered.y)
       ? steered
-      : correctPointIntoShieldClearance(steered, PLAYER_RED_ZONE_CLEARANCE + PLAYER_RED_STEER_BIAS);
-    if (isShieldClearanceSafePoint(landing.x, landing.y) &&
-      isShieldClearanceSafeSegment(origin, landing, PLAYER_RED_ZONE_CLEARANCE, false, RED_CLEARANCE_PATH_SLACK)) {
+      : correctPointOutOfRedClearance(steered, PLAYER_RED_ZONE_CLEARANCE + PLAYER_RED_STEER_BIAS);
+    if (isRedClearanceSafePoint(landing.x, landing.y) &&
+      isRedClearanceSafeSegment(origin, landing, PLAYER_RED_ZONE_CLEARANCE, false, RED_CLEARANCE_PATH_SLACK)) {
       return landing;
     }
     // 连半步都推不出安全落点：本帧不动，并让旧路径失效（同样限流），
     // 避免留下一条永远转不动的路径把队员钉在原地
-    const half = correctPointIntoShieldClearance(
+    const half = correctPointOutOfRedClearance(
       { x: (origin.x + steered.x) / 2, y: (origin.y + steered.y) / 2 },
       PLAYER_RED_ZONE_CLEARANCE + PLAYER_RED_STEER_BIAS
     );
     resetPlayerMemberReturn(member);
     member.returnReplanIn = PLAYER_MEMBER_RETURN_REPLAN_COOLDOWN;
-    return isShieldClearanceSafePoint(half.x, half.y) ? half : null;
+    return isRedClearanceSafePoint(half.x, half.y) ? half : null;
   }
 
   // 每帧按阵型摆放三名队员：位置只由碰撞体位置与阵型形态推导，移动本身仍由碰撞体驱动；
@@ -6998,8 +6495,8 @@
     // 就继续自由移动，不会提前把队伍收回三角阵型
     const edgeRange = squad.squeezed ? PLAYER_SQUAD_EDGE_EXIT_RANGE : PLAYER_SQUAD_EDGE_RANGE;
     const atRedEdge = !!squad.moveTarget && (
-      isPlayerSquadAtShieldEdge(squad, edgeRange) ||
-      living.some(member => isPointAtShieldEdge(member.character.x, member.character.y, edgeRange))
+      isPlayerSquadAtRedEdge(squad, edgeRange) ||
+      living.some(member => isPointAtRedEdge(member.character.x, member.character.y, edgeRange))
     );
     squad.squeezed = atRedEdge;
     updatePlayerSquadForward(squad, squad.detourPath[0] || squad.moveTarget);
@@ -7070,7 +6567,7 @@
     });
     if (squad.freeBlend <= 0) {
       // 纯三角阵型：整体平移避让红区，阵型间距严格保持；再处理队员间距兜底
-      fitPlayerSquadToShieldClearance(squad, positions);
+      fitPlayerSquadToRedClearance(squad, positions);
       resolvePlayerSquadOverlap(squad, positions);
     } else {
       // 自由散开（或正在收回阵型）：逐点修正，队员可以各自贴着安全带绕行
@@ -7123,10 +6620,10 @@
             renderX = steered.x;
             renderY = steered.y;
           } else {
-            // 规划失败：能沿屏蔽区轮廓滑动就沿轮廓走（这正是「沿屏蔽区移动」的形态），
+            // 规划失败：能沿红区轮廓滑动就沿轮廓走（这正是「沿屏蔽区移动」的形态），
             // 否则只沿已验证安全的直线回位方向靠近，两条路都不通就本帧原地不动。
             // 绝不允许为了靠近站位而直接穿进屏蔽区
-            const slide = slideAlongShieldRing({ x: renderX, y: renderY }, target, maxStep);
+            const slide = slideAlongRedContour({ x: renderX, y: renderY }, target, maxStep);
             if (slide) {
               if (Math.abs(slide.x - renderX) > 0.02) member.returnFacingLeft = slide.x < renderX;
               renderX = slide.x;
@@ -7517,9 +7014,9 @@
       } else if (updatePlayerMoveProgress(squad, time)) {
         // 终点在死角里、已经贴到最近的可站位置：本帧不再驱动移动
       } else {
-        let steer = getShieldSteeringTarget(origin, waypoint, stepBudget);
+        let steer = getPlayerSteeringTarget(origin, waypoint, stepBudget);
         if (!steer) {
-          // 当前朝向被屏蔽区净空带挡住：只在真正卡住时重新规划，且按冷却限流，
+          // 当前朝向被红区安全带挡住：只在真正卡住时重新规划，且按冷却限流，
           // 避免「同一个位置反复失败 → 逐帧全量寻路」把主线程拖死
           const replanKey = `${Math.round(origin.x)}:${Math.round(origin.y)}:` +
             `${Math.round(waypoint.x)}:${Math.round(waypoint.y)}`;
@@ -7530,22 +7027,14 @@
             if (replanned && replanned.length) {
               squad.detourPath = replanned;
               waypoint = squad.detourPath[0];
-              steer = getShieldSteeringTarget(origin, waypoint, stepBudget);
+              steer = getPlayerSteeringTarget(origin, waypoint, stepBudget);
             }
           }
         }
-        if (!steer) {
-          // 冷却期间也必须继续走：先沿路径往前收敛到一个当前位置可直达的节点（跳过被净空带
-          // 挡住的拐点），再退回以最终终点为参照求一次转向。不用「朝最终终点重转向」当第一兜底——
-          // 绕行途中最终终点在轮廓另一侧，方向与当前拐点相反，会拉着单位反向横跳
-          const reachable = getReachablePathNode(squad, origin);
-          if (reachable) {
-            waypoint = reachable;
-            steer = getShieldSteeringTarget(origin, waypoint, stepBudget);
-          }
-          if (!steer && waypoint !== squad.moveTarget) {
-            steer = getShieldSteeringTarget(origin, squad.moveTarget, stepBudget);
-          }
+        if (!steer && waypoint !== squad.moveTarget) {
+          // 冷却期间也必须继续走：绕开当前拐点，直接以最终终点为参照再求一次转向
+          // （内含「推离安全带」与「沿红区轮廓滑动」两级兜底），避免停在原地无限寻路
+          steer = getPlayerSteeringTarget(origin, squad.moveTarget, stepBudget);
         }
         if (!steer) {
           unit.body.stop();
@@ -7873,29 +7362,6 @@
   window.__WG__ = {
     get scene() { return gameScene; },
     get squads() { return playerSquads; },
-    // 只读的几何断言：落点是否可行走 / 是否满足 19 像素红区净空
-    walkable: (x, y) => isWalkable(x, y),
-    safe: (x, y) => isRedClearanceSafePoint(x, y, PLAYER_RED_ZONE_CLEARANCE),
-    // 只读：两块红区多边形（供离线几何断言与调试绘制）
-    redZones: () => collisionRegions.redForbiddenZones.map(zone => zone.map(point => ({ x: point.x, y: point.y }))),
-    // 只读：寻路性能度量快照
-    pathStats: () => Object.assign({}, redPathStats),
-    resetPathStats: () => { resetRedPathStats(); return true; },
-    // 只读：帧率与渲染统计（game 实例挂在场景上：gameScene.game）
-    perf: () => {
-      const loop = gameScene && gameScene.game ? gameScene.game.loop : null;
-      return {
-        fps: loop ? loop.actualFps : 0,
-        delta: loop ? loop.delta : 0
-      };
-    },
-    // 测试用：清空场上敌军。出生点位于敌军活动区内，多场景验证需要可控环境
-    clearEnemies: () => {
-      if (!enemiesGroup) return 0;
-      const list = enemiesGroup.getChildren().slice();
-      list.forEach(enemy => enemy.destroy());
-      return list.length;
-    },
     // 通过左上角出兵按钮的同一代码路径出 1 支小队
     spawn: () => handleSpawnOption('jf'),
     // 选中全部已出场小队
@@ -7996,70 +7462,7 @@
       enemies: enemiesGroup.getChildren().filter(e => e.active).map(e => ({
         x: Math.round(e.x), y: Math.round(e.y), hp: Math.round(e.hp)
       }))
-    }),
-    // ---- 绿色屏蔽区 / 盾判定（仅供验证） ----
-    // 只读：点是否满足绿色屏蔽区净空（可行动区内侧且距边界 ≥ 绿净空）
-    greenSafe: (x, y) => isGreenClearanceSafePoint(x, y, PLAYER_GREEN_ZONE_CLEARANCE),
-    // 只读：点是否同时满足红区与绿色屏蔽区净空（我方单位的判定口径）
-    shieldSafe: (x, y) => isShieldClearanceSafePoint(x, y, PLAYER_RED_ZONE_CLEARANCE),
-    // 只读：点到可行动区轮廓折线的精确距离（无符号，正数也可能落在屏蔽区外侧）
-    greenClearance: (x, y) => getZoneNearestEdge(collisionRegions.walkableBoundary, x, y).distance,
-    // 只读：可行动区轮廓多边形（绿线）
-    boundary: () => collisionRegions.walkableBoundary.map(point => ({ x: point.x, y: point.y })),
-    // 只读：按我方单位口径规划一条路径（不驱动任何单位）
-    planPath: (sx, sy, ex, ey) => {
-      const path = getShortestPlayerPath({ x: sx, y: sy }, { x: ex, y: ey });
-      return path ? path.map(point => ({ x: point.x, y: point.y })) : null;
-    },
-    // 只读：整条路径是否满足盾净空（严格口径）
-    shieldPathSafe: (sx, sy, path) => !!path && path.length && isClearancePathSafe(
-      { x: sx, y: sy }, path, PLAYER_RED_ZONE_CLEARANCE, true, isShieldClearanceSafeSegment
-    ),
-    // 只读：屏蔽环规模统计（轮廓采样点数 / A* 候选节点数 / 不安全弦数）。
-    // 绿环的 unsafeChords 恒为 1，且必定是横跨 x≈3774.7、y∈[1057,1897] 的那条弦：
-    // 那条带整段落在红区 2 内部，不存在任何安全站位，绿轮廓被过滤后留下一个缺口，
-    // 缺口两端被补插流程连成一条「墙」（该段本就被红环覆盖）。A* 与贴边行走
-    // 都会用线段净空判定否决它，因此它不会出现在任何返回的路径里
-    ringStats: () => {
-      const greenNodes = getRedZoneContourNodes(
-        collisionRegions.walkableBoundary, PLAYER_GREEN_ZONE_CLEARANCE, GREEN_SHIELD_RING
-      );
-      let greenUnsafeChords = 0;
-      for (let index = 0; index < greenNodes.length; index++) {
-        const next = greenNodes[(index + 1) % greenNodes.length];
-        if (greenNodes.length > 1 &&
-          !isShieldClearanceSafeSegment(greenNodes[index], next, PLAYER_GREEN_ZONE_CLEARANCE)) {
-          greenUnsafeChords += 1;
-        }
-      }
-      return {
-        red: collisionRegions.redForbiddenZones.map(zone => ({
-          contour: getRedZoneContourEntry(zone, PLAYER_RED_ZONE_CLEARANCE).points.length,
-          nodes: getRedZoneContourNodes(zone, PLAYER_RED_ZONE_CLEARANCE).length
-        })),
-        green: {
-          contour: getRedZoneContourEntry(
-            collisionRegions.walkableBoundary,
-            PLAYER_GREEN_ZONE_CLEARANCE,
-            GREEN_SHIELD_RING.offsetSign,
-            GREEN_SHIELD_RING.pointSafe,
-            GREEN_SHIELD_RING.correct
-          ).points.length,
-          nodes: greenNodes.length,
-          unsafeChords: greenUnsafeChords,
-          nodeLimit: PLAYER_RED_WALK_LEG_CANDIDATE_LIMIT
-        }
-      };
-    },
-    // 只读：敌方行军状态（验证「仅我方单位」的改动边界）
-    enemyReport: () => enemiesGroup.getChildren().filter(e => e.active).map(e => ({
-      x: Math.round(e.x),
-      y: Math.round(e.y),
-      hp: Math.round(e.hp),
-      routeState: e.routeState || null,
-      waypointIndex: Number.isFinite(e.waypointIndex) ? e.waypointIndex : null,
-      nodes: e.detourPath ? e.detourPath.length : 0
-    }))
+    })
   };
 </script>
 
